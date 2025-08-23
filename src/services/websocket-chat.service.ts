@@ -58,7 +58,8 @@ export class WebSocketChatService {
         }
 
         const decoded = jwt.verify(token, SECRET_KEY) as any;
-        socket.userId = decoded.id;
+        // Support tokens storing user id as _id (our AuthService) or id
+        socket.userId = decoded._id || decoded.id;
         socket.user = decoded;
 
         logger.info(`WebSocket authenticated: User ${socket.userId}`);
@@ -95,7 +96,7 @@ export class WebSocketChatService {
           let session = await ChatSessionModel.findOne({ id: sessionId, userId });
 
           if (!session) {
-            session = await this.createSession(userId, 'Chat Session');
+            session = await this.createSession(userId, 'Chat Session', sessionId);
           }
 
           // Join the session room
@@ -122,7 +123,7 @@ export class WebSocketChatService {
       // Handle sending messages
       socket.on('send-message', async (data: WebSocketEvents['send-message']) => {
         try {
-          const { message, sessionId } = data;
+          const { message, sessionId, dbUrl, dbType } = data;
           const userId = socket.userId;
 
           // Validate session access
@@ -154,8 +155,24 @@ export class WebSocketChatService {
           // Get conversation history
           const conversationHistory = await ChatMessageModel.find({ sessionId }).sort({ createdAt: -1 }).limit(20).lean();
 
-          // Process message with database agent
-          const agentResponse = await this.databaseAgent.processMessage(message, userId, sessionId, conversationHistory.reverse());
+          // Process message
+          let agentResponse;
+          if (dbUrl) {
+            // If DB URL provided in chat, route to the new AI Agent multi-DB flow directly
+            const aiAgent = new (require('./ai-agent.service').AIAgentService)();
+            const result = await aiAgent.processQuery(message, userId, { dbUrl, dbType: dbType as any });
+            agentResponse = {
+              message: typeof result?.data === 'object' ? JSON.stringify(result.data) : String(result?.data ?? ''),
+              type: 'data',
+              data: result.data,
+              toolsUsed: ['ai-agent'],
+              executionTime: result.executionTime,
+              confidence: 0.8,
+            } as any;
+          } else {
+            // Fallback to the existing database agent workflow
+            agentResponse = await this.databaseAgent.processMessage(message, userId, sessionId, conversationHistory.reverse());
+          }
 
           // Create agent message
           const agentMessage = await this.createMessage({
@@ -317,9 +334,9 @@ export class WebSocketChatService {
     return message.toObject();
   }
 
-  private async createSession(userId: string, title?: string): Promise<ChatSession & Document & { _id: any }> {
+  private async createSession(userId: string, title?: string, id?: string): Promise<ChatSession & Document & { _id: any }> {
     const sessionData = {
-      id: uuidv4(),
+      id: id || uuidv4(),
       userId,
       title: title || `Chat ${new Date().toLocaleString()}`,
       isActive: true,

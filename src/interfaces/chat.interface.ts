@@ -70,7 +70,7 @@ export interface AgentState {
 export interface WebSocketEvents {
   // Client to Server
   'join-session': { sessionId: string; userId: string };
-  'send-message': { message: string; sessionId: string };
+  'send-message': { message: string; sessionId: string; dbUrl?: string; dbType?: 'mongodb' | 'postgres' | 'mysql' };
   typing: { sessionId: string; isTyping: boolean };
   'get-sessions': { userId: string };
   'create-session': { userId: string; title?: string };

@@ -319,6 +319,7 @@ Examples:
     return text
       .replace(/ObjectId\("([0-9a-fA-F]{24})"\)/g, '"$1"')
       .replace(/new Date\("([^"]+)"\)/g, '"$1"')
+      .replace(/ISODate\("([^"]+)"\)/g, '"$1"')
       .replace(/\bTrue\b/g, 'true')
       .replace(/\bFalse\b/g, 'false');
   }
@@ -356,7 +357,8 @@ Examples:
       if (queryObj.operation === 'sql') {
         const sqlQuery = queryObj as SQLQueryObject;
         // Guardrail: block dangerous SQL verbs
-        const lowerSql = (sqlQuery.sql || '').toLowerCase();
+        let sqlText = sqlQuery.sql || '';
+        const lowerSql = sqlText.toLowerCase();
         if (/\b(drop|truncate|alter)\b/.test(lowerSql)) {
           throw new Error('Dangerous SQL operation blocked');
         }
@@ -369,12 +371,22 @@ Examples:
           throw new Error('UPDATE without WHERE is blocked');
         }
 
+        // Additional SQL hardening
+        if (/--|\/\*/.test(sqlText)) {
+          throw new Error('SQL comments are blocked');
+        }
+        const semicolons = (sqlText.match(/;/g) || []).length;
+        if (semicolons > 1) {
+          throw new Error('Multiple SQL statements are blocked');
+        }
+        sqlText = sqlText.replace(/;\s*$/, '');
+
         if (dbConnection.type === 'postgres') {
-          const result = await dbConnection.pg.query(sqlQuery.sql, sqlQuery.parameters || []);
+          const result = await dbConnection.pg.query(sqlText, sqlQuery.parameters || []);
           return result.rows;
         } else if (dbConnection.type === 'mysql') {
           // Normalize Postgres-style params ($1,$2,...) to MySQL (?) if needed
-          let sql = sqlQuery.sql;
+          let sql = sqlText;
           if (/\$\d+/.test(sql)) {
             const paramCount = (sql.match(/\$\d+/g) || []).length;
             sql = sql.replace(/\$\d+/g, '?');
@@ -389,6 +401,17 @@ Examples:
         // MongoDB query
         const mongoQuery = queryObj as MongoQueryObject;
         const { operation, collection, filter = {}, projection = { password: 0 }, sort, limit, document, update } = mongoQuery;
+        // Guardrail: block dangerous Mongo operators in filters
+        const containsDangerousMongo = (obj: any): boolean => {
+          if (!obj || typeof obj !== 'object') return false;
+          if (Array.isArray(obj)) return obj.some(containsDangerousMongo);
+          return Object.keys(obj).some(k =>
+            k === '$where' || k === '$function' || (typeof obj[k] === 'object' && containsDangerousMongo(obj[k]))
+          );
+        };
+        if (containsDangerousMongo(filter)) {
+          throw new Error('Dangerous Mongo operator in filter is blocked');
+        }
         
         // Get the appropriate model
         const model = this.getModelForCollection(collection, dbConnection.mongo);
@@ -422,7 +445,8 @@ Examples:
           case 'updateOne':
             if (!filter || Object.keys(filter).length === 0) throw new Error('updateOne requires a specific filter');
             if (!update || typeof update !== 'object') throw new Error('updateOne requires an update object');
-            return await model.updateOne(filter, update, { upsert: false });
+            const safeUpdate = Object.keys(update).some(k => k.startsWith('$')) ? update : { $set: update };
+            return await model.updateOne(filter, safeUpdate, { upsert: false });
 
           case 'deleteOne':
             if (!filter || Object.keys(filter).length === 0) throw new Error('deleteOne requires a specific filter');
@@ -450,7 +474,7 @@ Examples:
 
     // Create dynamic model if not found
     const dynamicSchema = new mongoose.Schema({}, { strict: false });
-    return connection.model(collectionName, dynamicSchema);
+    return connection.model(collectionName, dynamicSchema, collectionName);
   }
 
   public async getSampleQueries(): Promise<string[]> {

@@ -147,6 +147,73 @@ paths:
         500:
           description: 'Server Error'
 
+# [POST] ai-agent/feedback
+  /api/ai-agent/feedback:
+    post:
+      tags:
+      - ai-agent
+      summary: Record feedback for a query
+      parameters:
+      - name: Authorization
+        in: header
+        required: true
+        type: string
+        description: Bearer token
+      - name: body
+        in: body
+        required: true
+        schema:
+          $ref: '#/definitions/aiFeedback'
+      responses:
+        200:
+          description: 'OK'
+        400:
+          description: 'Bad Request'
+        401:
+          description: 'Unauthorized'
+        500:
+          description: 'Server Error'
+
+# [GET] ai-agent/stats
+  /api/ai-agent/stats:
+    get:
+      tags:
+      - ai-agent
+      summary: Get user query statistics
+      parameters:
+      - name: Authorization
+        in: header
+        required: true
+        type: string
+        description: Bearer token
+      responses:
+        200:
+          description: 'OK'
+        401:
+          description: 'Unauthorized'
+        500:
+          description: 'Server Error'
+
+# [POST] ai-agent/refresh-schema
+  /api/ai-agent/refresh-schema:
+    post:
+      tags:
+      - ai-agent
+      summary: Refresh schema cache
+      parameters:
+      - name: Authorization
+        in: header
+        required: true
+        type: string
+        description: Bearer token
+      responses:
+        200:
+          description: 'OK'
+        401:
+          description: 'Unauthorized'
+        500:
+          description: 'Server Error'
+
 # definitions
 definitions:
   users:
@@ -166,6 +233,7 @@ definitions:
     type: object
     required:
         - query
+        - dbUrl
     properties:
       query:
         type: string
@@ -173,7 +241,317 @@ definitions:
         minLength: 3
         maxLength: 500
         example: "Get all users with Gmail email addresses"
+      dbUrl:
+        type: string
+        description: Database connection string (MongoDB/PostgreSQL/MySQL)
+        example: "postgresql://user:pass@localhost:5432/mydb"
+      dbType:
+        type: string
+        enum: [mongodb, postgres, mysql]
+        description: Optional hint for database type, auto-detected from dbUrl if omitted
+
+  aiFeedback:
+    type: object
+    required:
+      - queryId
+      - feedback
+    properties:
+      queryId:
+        type: string
+      feedback:
+        type: string
+        enum: [positive, negative]
 
 schemes:
  - https
  - http
+
+# Socket.IO documentation (custom extension)
+x-socketio:
+  url: ws(s)://<host>
+  auth:
+    description: |
+      Use Socket.IO auth with a JWT token.
+      Example (client): io('http://localhost:3000', { auth: { token: 'Bearer <JWT>' } })
+      Or send Authorization header: 'Authorization: Bearer <JWT>'
+  events:
+    client_to_server:
+      - name: join-session
+        summary: Join a chat session
+        payload:
+          $ref: '#/definitions/wsJoinSession'
+      - name: send-message
+        summary: Send a message (optionally include dbUrl/dbType to route to multi-DB AI agent)
+        payload:
+          $ref: '#/definitions/wsSendMessage'
+      - name: typing
+        summary: Typing indicator
+        payload:
+          $ref: '#/definitions/wsTyping'
+      - name: get-sessions
+        summary: List active sessions for the user
+        payload:
+          $ref: '#/definitions/wsGetSessions'
+      - name: create-session
+        summary: Create a new chat session
+        payload:
+          $ref: '#/definitions/wsCreateSession'
+      - name: delete-session
+        summary: Soft-delete a chat session
+        payload:
+          $ref: '#/definitions/wsDeleteSession'
+    server_to_client:
+      - name: session-joined
+        payload:
+          $ref: '#/definitions/wsSessionJoined'
+      - name: message-received
+        payload:
+          $ref: '#/definitions/wsMessageReceived'
+      - name: agent-thinking
+        payload:
+          $ref: '#/definitions/wsAgentThinking'
+      - name: agent-response
+        payload:
+          $ref: '#/definitions/wsAgentResponse'
+      - name: typing-indicator
+        payload:
+          $ref: '#/definitions/wsTypingIndicator'
+      - name: sessions-list
+        payload:
+          $ref: '#/definitions/wsSessionsList'
+      - name: session-created
+        payload:
+          $ref: '#/definitions/wsSessionCreated'
+      - name: session-deleted
+        payload:
+          $ref: '#/definitions/wsSessionDeleted'
+      - name: error
+        payload:
+          $ref: '#/definitions/wsError'
+
+# WebSocket (Socket.IO) schemas
+definitions:
+  ChatMessage:
+    type: object
+    properties:
+      id:
+        type: string
+      userId:
+        type: string
+      sessionId:
+        type: string
+      message:
+        type: string
+      type:
+        type: string
+        enum: [user, agent, system]
+      timestamp:
+        type: string
+        format: date-time
+      metadata:
+        type: object
+        properties:
+          queryType:
+            type: string
+          executionTime:
+            type: number
+          dataRetrieved:
+            type: boolean
+          toolsUsed:
+            type: array
+            items:
+              type: string
+          confidence:
+            type: number
+
+  ChatSession:
+    type: object
+    properties:
+      id:
+        type: string
+      userId:
+        type: string
+      title:
+        type: string
+      isActive:
+        type: boolean
+      createdAt:
+        type: string
+        format: date-time
+      updatedAt:
+        type: string
+        format: date-time
+      messageCount:
+        type: integer
+      lastActivity:
+        type: string
+        format: date-time
+      context:
+        type: object
+        properties:
+          currentTopic:
+            type: string
+          recentQueries:
+            type: array
+            items:
+              type: string
+          userPreferences:
+            type: object
+          databaseContext:
+            type: array
+            items:
+              type: string
+
+  AgentResponse:
+    type: object
+    properties:
+      message:
+        type: string
+      type:
+        type: string
+        enum: [text, data, error, thinking]
+      data:
+        type: object
+      suggestions:
+        type: array
+        items:
+          type: string
+      toolsUsed:
+        type: array
+        items:
+          type: string
+      executionTime:
+        type: number
+      confidence:
+        type: number
+      followUpQuestions:
+        type: array
+        items:
+          type: string
+
+  wsJoinSession:
+    type: object
+    required: [sessionId, userId]
+    properties:
+      sessionId:
+        type: string
+      userId:
+        type: string
+
+  wsSendMessage:
+    type: object
+    required: [message, sessionId]
+    properties:
+      message:
+        type: string
+      sessionId:
+        type: string
+      dbUrl:
+        type: string
+        description: Optional DB connection string to route to multi-DB AI agent
+      dbType:
+        type: string
+        enum: [mongodb, postgres, mysql]
+        description: Optional DB type hint
+
+  wsTyping:
+    type: object
+    required: [sessionId, isTyping]
+    properties:
+      sessionId:
+        type: string
+      isTyping:
+        type: boolean
+
+  wsGetSessions:
+    type: object
+    required: [userId]
+    properties:
+      userId:
+        type: string
+
+  wsCreateSession:
+    type: object
+    required: [userId]
+    properties:
+      userId:
+        type: string
+      title:
+        type: string
+
+  wsDeleteSession:
+    type: object
+    required: [sessionId, userId]
+    properties:
+      sessionId:
+        type: string
+      userId:
+        type: string
+
+  wsSessionJoined:
+    type: object
+    properties:
+      sessionId:
+        type: string
+      session:
+        $ref: '#/definitions/ChatSession'
+
+  wsMessageReceived:
+    type: object
+    properties:
+      message:
+        $ref: '#/definitions/ChatMessage'
+
+  wsAgentThinking:
+    type: object
+    properties:
+      message:
+        type: string
+      sessionId:
+        type: string
+
+  wsAgentResponse:
+    type: object
+    properties:
+      response:
+        $ref: '#/definitions/AgentResponse'
+      sessionId:
+        type: string
+
+  wsTypingIndicator:
+    type: object
+    properties:
+      userId:
+        type: string
+      isTyping:
+        type: boolean
+      sessionId:
+        type: string
+
+  wsSessionsList:
+    type: object
+    properties:
+      sessions:
+        type: array
+        items:
+          $ref: '#/definitions/ChatSession'
+
+  wsSessionCreated:
+    type: object
+    properties:
+      session:
+        $ref: '#/definitions/ChatSession'
+
+  wsSessionDeleted:
+    type: object
+    properties:
+      sessionId:
+        type: string
+
+  wsError:
+    type: object
+    properties:
+      message:
+        type: string
+      code:
+        type: string

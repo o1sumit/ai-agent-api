@@ -3,6 +3,7 @@ import compression from 'compression';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import express from 'express';
+import path from 'path';
 import helmet from 'helmet';
 import hpp from 'hpp';
 import morgan from 'morgan';
@@ -72,6 +73,9 @@ export class App {
   }
 
   private initializeRoutes(routes: Routes[]) {
+    // Serve static playground for WebSocket testing
+    this.app.use('/playground', express.static(path.join(process.cwd(), 'playground')));
+
     routes.forEach(route => {
       this.app.use('/', route.router);
     });
