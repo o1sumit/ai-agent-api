@@ -1,0 +1,115 @@
+### Enhanced AI Agent API Endpoints
+
+### Get AI Agent Status (Public)
+GET http://localhost:3000/ai-agent/status
+Content-Type: application/json
+
+###
+
+### Get Sample Queries (Public)
+GET http://localhost:3000/ai-agent/samples
+Content-Type: application/json
+
+###
+
+### Login to get JWT token (Required for authenticated endpoints)
+POST http://localhost:3000/login
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "password": "password123"
+}
+
+###
+
+### Process Natural Language Query (Requires Authentication)
+POST http://localhost:3000/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "Get all users"
+}
+
+###
+
+### Process Query - Find User by Email (Requires Authentication)
+POST http://localhost:3000/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "Find user with email john@example.com"
+}
+
+###
+
+### Process Query - Count Users (Requires Authentication)
+POST http://localhost:3000/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "How many users are registered?"
+}
+
+###
+
+### Process Query - Recent Users (Requires Authentication)
+POST http://localhost:3000/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "Show me users created in the last 7 days"
+}
+
+###
+
+### Process Query - Gmail Users (Requires Authentication)
+POST http://localhost:3000/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "Find all users with Gmail email addresses"
+}
+
+###
+
+### Record Positive Feedback (Requires Authentication)
+POST http://localhost:3000/ai-agent/feedback
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "queryId": "QUERY_ID_FROM_RESPONSE",
+  "feedback": "positive"
+}
+
+###
+
+### Record Negative Feedback (Requires Authentication)
+POST http://localhost:3000/ai-agent/feedback
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "queryId": "QUERY_ID_FROM_RESPONSE",
+  "feedback": "negative"
+}
+
+###
+
+### Get User Statistics (Requires Authentication)
+GET http://localhost:3000/ai-agent/stats
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Refresh Schema Cache (Requires Authentication)
+POST http://localhost:3000/ai-agent/refresh-schema
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE

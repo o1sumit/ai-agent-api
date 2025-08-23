@@ -1,0 +1,102 @@
+### WebSocket Chat API Endpoints
+
+### Login to get JWT token (Required for all endpoints)
+POST http://localhost:3000/login
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "password": "password123"
+}
+
+###
+
+### Get User's Chat Sessions
+GET http://localhost:3000/chat/sessions
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Get User's Chat Sessions with Pagination
+GET http://localhost:3000/chat/sessions?limit=10&offset=0
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Get Session Message History
+GET http://localhost:3000/chat/sessions/SESSION_ID_HERE/history
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Update Session Title
+PUT http://localhost:3000/chat/sessions/SESSION_ID_HERE/title
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "title": "Database Analysis Chat"
+}
+
+###
+
+### Delete Session
+DELETE http://localhost:3000/chat/sessions/SESSION_ID_HERE
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Get Chat Statistics
+GET http://localhost:3000/chat/stats
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Search Messages
+GET http://localhost:3000/chat/search?query=users&limit=20
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Search Messages in Specific Session
+GET http://localhost:3000/chat/search?query=database&sessionId=SESSION_ID_HERE&limit=10
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+### WebSocket Connection Example (JavaScript)
+# const socket = io('http://localhost:3000', {
+#   auth: {
+#     token: 'YOUR_JWT_TOKEN_HERE'
+#   }
+# });
+#
+# // Join a session
+# socket.emit('join-session', {
+#   sessionId: 'session-id',
+#   userId: 'user-id'
+# });
+#
+# // Send a message
+# socket.emit('send-message', {
+#   message: 'Get all users from the database',
+#   sessionId: 'session-id'
+# });
+#
+# // Listen for responses
+# socket.on('message-received', (message) => {
+#   console.log('New message:', message);
+# });
+#
+# socket.on('agent-response', (response) => {
+#   console.log('Agent response:', response);
+# });
+#
+# socket.on('agent-thinking', (thinking) => {
+#   console.log('Agent is thinking:', thinking.message);
+# });
