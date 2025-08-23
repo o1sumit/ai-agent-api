@@ -1,15 +1,15 @@
-import { Service } from 'typedi';
-import { StateGraph, END, START } from '@langchain/langgraph';
-import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import { GOOGLE_API_KEY } from '@config';
+import { AgentResponse, AgentState, DatabaseTool } from '@interfaces/chat.interface';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { DynamicTool } from '@langchain/core/tools';
-import { GOOGLE_API_KEY } from '@config';
-import { SchemaDetectorService } from './schema-detector.service';
-import { AIMemoryService } from './ai-memory.service';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import { END, START, StateGraph } from '@langchain/langgraph';
 import { UserModel } from '@models/users.model';
-import { AgentState, AgentResponse, DatabaseTool } from '@interfaces/chat.interface';
 import { logger } from '@utils/logger';
 import mongoose from 'mongoose';
+import { Service } from 'typedi';
+import { AIMemoryService } from './ai-memory.service';
+import { SchemaDetectorService } from './schema-detector.service';
 
 @Service()
 export class DatabaseAgentService {
@@ -69,7 +69,7 @@ export class DatabaseAgentService {
         currentQuery: message,
         context: {
           userId,
-          sessionId,
+          sessionId: _sessionId,
           conversationHistory,
         },
         tools: await this.createDatabaseTools(),
