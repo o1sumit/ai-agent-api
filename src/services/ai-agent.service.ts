@@ -22,7 +22,8 @@ export class AIAgentService {
 
     this.llm = new ChatGoogleGenerativeAI({
       apiKey: GOOGLE_API_KEY,
-      model: 'gemini-1.5-flash',
+      // model: 'gemini-2.5-pro', // Official Gemini 2.5 Pro model ID
+      model: 'gemini-2.0-flash',
       temperature: 0.1,
     });
 
