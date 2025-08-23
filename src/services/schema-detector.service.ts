@@ -9,35 +9,36 @@ export class SchemaDetectorService {
   private cacheExpiry: Map<string, number> = new Map();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-  public async getAllSchemas(): Promise<CollectionSchema[]> {
+  public async getAllSchemas(conn?: mongoose.Connection): Promise<CollectionSchema[]> {
     try {
-      const db = mongoose.connection.db;
+      const db = (conn || mongoose.connection).db;
       const collections = await db.listCollections().toArray();
       const schemas: CollectionSchema[] = [];
 
       for (const collection of collections) {
-        const schema = await this.getCollectionSchema(collection.name);
+        const schema = await this.getCollectionSchema(collection.name, conn);
         if (schema) {
           schemas.push(schema);
         }
       }
 
       return schemas;
-    } catch (error) {
+    } catch (error: any) {
       logger.error(`Error getting all schemas: ${error.message}`);
       throw error;
     }
   }
 
-  public async getCollectionSchema(collectionName: string): Promise<CollectionSchema | null> {
+  public async getCollectionSchema(collectionName: string, conn?: mongoose.Connection): Promise<CollectionSchema | null> {
     try {
       // Check cache first
-      const cached = this.getCachedSchema(collectionName);
+      const cacheKey = `${conn ? 'external' : 'default'}_${collectionName}`;
+      const cached = this.getCachedSchema(cacheKey);
       if (cached) {
         return cached;
       }
 
-      const db = mongoose.connection.db;
+      const db = (conn || mongoose.connection).db;
       const collection = db.collection(collectionName);
 
       // Get sample documents to infer schema
@@ -54,7 +55,7 @@ export class SchemaDetectorService {
       const fields = this.inferSchemaFromSamples(samples);
 
       // Get Mongoose model info if available
-      const mongooseSchema = this.getMongooseSchemaInfo(collectionName);
+      const mongooseSchema = this.getMongooseSchemaInfo(collectionName, conn);
       if (mongooseSchema) {
         this.mergeMongooseSchemaInfo(fields, mongooseSchema);
       }
@@ -67,7 +68,7 @@ export class SchemaDetectorService {
       };
 
       // Cache the result
-      this.cacheSchema(collectionName, schema);
+      this.cacheSchema(cacheKey, schema);
 
       return schema;
     } catch (error) {
@@ -76,9 +77,9 @@ export class SchemaDetectorService {
     }
   }
 
-  private getCachedSchema(collectionName: string): CollectionSchema | null {
-    const cached = this.schemaCache.get(collectionName);
-    const expiry = this.cacheExpiry.get(collectionName);
+  private getCachedSchema(cacheKey: string): CollectionSchema | null {
+    const cached = this.schemaCache.get(cacheKey);
+    const expiry = this.cacheExpiry.get(cacheKey);
 
     if (cached && expiry && Date.now() < expiry) {
       return cached;
@@ -86,16 +87,16 @@ export class SchemaDetectorService {
 
     // Remove expired cache
     if (cached) {
-      this.schemaCache.delete(collectionName);
-      this.cacheExpiry.delete(collectionName);
+      this.schemaCache.delete(cacheKey);
+      this.cacheExpiry.delete(cacheKey);
     }
 
     return null;
   }
 
-  private cacheSchema(collectionName: string, schema: CollectionSchema): void {
-    this.schemaCache.set(collectionName, schema);
-    this.cacheExpiry.set(collectionName, Date.now() + this.CACHE_TTL);
+  private cacheSchema(cacheKey: string, schema: CollectionSchema): void {
+    this.schemaCache.set(cacheKey, schema);
+    this.cacheExpiry.set(cacheKey, Date.now() + this.CACHE_TTL);
   }
 
   private inferSchemaFromSamples(samples: any[]): SchemaField[] {
@@ -204,17 +205,17 @@ export class SchemaDetectorService {
     return 'Mixed';
   }
 
-  private getMongooseSchemaInfo(collectionName: string): any {
+  private getMongooseSchemaInfo(collectionName: string, conn?: mongoose.Connection): any {
     try {
       // Try to find the Mongoose model
-      const models = mongoose.models;
+      const models = conn ? conn.models : mongoose.models;
       const modelName = Object.keys(models).find(name => models[name].collection.name === collectionName);
 
       if (modelName) {
         const model = models[modelName];
         return model.schema;
       }
-    } catch (error) {
+    } catch (error: any) {
       logger.warn(`Could not get Mongoose schema info for ${collectionName}: ${error.message}`);
     }
     return null;

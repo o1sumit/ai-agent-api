@@ -1,5 +1,9 @@
+export type DBType = 'mongodb' | 'postgres' | 'mysql';
+
 export interface AIQueryRequest {
   query: string;
+  dbUrl: string;
+  dbType?: DBType;
 }
 
 export interface AIQueryResponse {
@@ -39,6 +43,13 @@ export interface MongoQueryObject {
   projection?: any;
   sort?: any;
   limit?: number;
+}
+
+export interface SQLQueryObject {
+  operation: 'sql';
+  queryString: string;
+  sql: string;
+  parameters?: any[];
 }
 
 export interface AIFeedbackRequest {

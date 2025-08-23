@@ -9,7 +9,7 @@ export class AIAgentController {
 
   public processQuery = async (req: RequestWithUser, res: Response, next: NextFunction) => {
     try {
-      const { query }: AIQueryRequest = req.body;
+      const { query, dbUrl, dbType }: AIQueryRequest = req.body;
       const userId = req.user?._id || 'anonymous';
 
       if (!query || typeof query !== 'string' || query.trim().length === 0) {
@@ -18,7 +18,13 @@ export class AIAgentController {
         });
       }
 
-      const result = await this.aiAgent.processQuery(query.trim(), userId.toString());
+      if (!dbUrl || typeof dbUrl !== 'string' || dbUrl.trim().length === 0) {
+        return res.status(400).json({
+          message: 'dbUrl is required and must be a non-empty string',
+        });
+      }
+
+      const result = await this.aiAgent.processQuery(query.trim(), userId.toString(), { dbUrl: dbUrl.trim(), dbType });
 
       res.status(200).json(result);
     } catch (error) {
@@ -43,10 +49,12 @@ export class AIAgentController {
     try {
       res.status(200).json({
         status: 'active',
-        message: 'AI Agent is running with dynamic schema detection and user memory',
-        supportedOperations: ['find', 'findOne', 'count', 'aggregate'],
+        message: 'AI Agent is running with dynamic schema detection, user memory, and multi-database support',
+        supportedOperations: ['find', 'findOne', 'count', 'aggregate', 'sql'],
         features: [
           'Dynamic schema detection',
+          'Multi-database support (MongoDB, PostgreSQL, MySQL)',
+          'Connection pooling',
           'User-specific memory',
           'Query optimization based on history',
           'Personalized suggestions',
