@@ -43,6 +43,10 @@ export interface MongoQueryObject {
   projection?: any;
   sort?: any;
   limit?: number;
+  // Optional fields for CRUD operations
+  document?: any; // for insertOne
+  update?: any; // for updateOne
+  options?: any; // optional driver options
 }
 
 export interface SQLQueryObject {

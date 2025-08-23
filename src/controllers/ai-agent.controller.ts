@@ -49,12 +49,13 @@ export class AIAgentController {
     try {
       res.status(200).json({
         status: 'active',
-        message: 'AI Agent is running with dynamic schema detection, user memory, and multi-database support',
-        supportedOperations: ['find', 'findOne', 'count', 'aggregate', 'sql'],
+        message: 'AI Agent is running with dynamic schema detection, user memory, multi-database, and safe CRUD support',
+        supportedOperations: ['find', 'findOne', 'count', 'aggregate', 'insertOne', 'updateOne', 'deleteOne', 'sql'],
         features: [
           'Dynamic schema detection',
           'Multi-database support (MongoDB, PostgreSQL, MySQL)',
           'Connection pooling',
+          'Safe CRUD with strict guardrails',
           'User-specific memory',
           'Query optimization based on history',
           'Personalized suggestions',

@@ -147,51 +147,56 @@ export class AIAgentService {
   }
 
   private async generateMongoQuery(userQuery: string, schemaInfo: string, memoryContext: string): Promise<MongoQueryObject> {
-
-    const systemPrompt = `You are an advanced MongoDB query generator with user context awareness. Generate optimized MongoDB queries based on the user's natural language input, database schema, and their query history.
+    const systemPrompt = `You are a strict, safety-first MongoDB query generator. Generate optimized and SAFE MongoDB operations (CRUD and analysis) from natural language, the database schema, and user history.
 
 Database Schema:
 ${schemaInfo}
 
 ${memoryContext}
 
-Rules:
-1. Generate only valid MongoDB queries for the available collections
-2. Use appropriate MongoDB operators ($eq, $ne, $gt, $lt, $gte, $lte, $in, $regex, etc.)
-3. Always exclude password and sensitive fields in projections
-4. Consider the user's skill level and previous query patterns
-5. For beginners, prefer simpler queries; for advanced users, suggest more complex operations
-6. If user frequently queries certain collections, prioritize those
-7. Use the user's previous successful query patterns as guidance
-8. Return the response in this exact JSON format:
+Strong Safety Rules:
+1) NEVER generate deleteMany or updateMany. Only allow deleteOne and updateOne.
+2) NEVER generate deleteOne or updateOne with an empty filter. The filter MUST target a specific document (e.g., by _id or another unique field).
+3) NEVER include sensitive fields (like password, accessToken, secrets) in projections or write payloads.
+4) For updates, prefer $set and do not unset critical identifiers.
+5) For aggregates, do not use $out/$merge stages.
+6) For reads, prefer minimal projections (exclude sensitive fields).
+7) Always specify the collection name.
 
+Output JSON Format (pick the appropriate fields per operation):
 {
-  "operation": "find|findOne|aggregate|count",
-  "queryString": "Human readable description of what the query does",
+  "operation": "find|findOne|aggregate|count|insertOne|updateOne|deleteOne",
+  "queryString": "Human readable description",
   "collection": "collection_name",
-  "filter": {MongoDB filter object},
-  "projection": {MongoDB projection object},
-  "sort": {MongoDB sort object if needed},
-  "limit": number if needed
+  "filter": { ... },
+  "projection": { ... },
+  "sort": { ... },
+  "limit": number,
+  "pipeline": [ ... ],
+  "document": { ... },
+  "update": { "$set": { ... } },
+  "options": { ... }
 }
 
-Important:
-- Always specify the collection name
-- For user queries, default to "users" collection unless another collection is clearly specified
+Additional Guidance:
 - Use regex for text searches: {"field": {"$regex": "pattern", "$options": "i"}}
-- For date ranges, use appropriate date objects
-- Consider user's frequent patterns and suggest optimizations
+- Use DATE_7_DAYS_AGO, DATE_30_DAYS_AGO, DATE_TODAY placeholders in filters; they will be converted to Date objects.
+- For write operations, only include relevant fields, never passwords.
 
 Examples:
-- "Get all users" → {"operation": "find", "collection": "users", "queryString": "Find all users", "filter": {}, "projection": {"password": 0}}
-- "Find user with email john@example.com" → {"operation": "findOne", "collection": "users", "queryString": "Find user by email", "filter": {"email": "john@example.com"}, "projection": {"password": 0}}`;
+- Read: {"operation":"find","collection":"users","queryString":"Get first 10 users","filter":{},"projection":{"password":0},"sort":{"createdAt":-1},"limit":10}
+- Insert: {"operation":"insertOne","collection":"products","queryString":"Create a product","document":{"name":"Remede Serum","price":59.99}}
+- Update: {"operation":"updateOne","collection":"products","queryString":"Update product price","filter":{"sku":"RMD-001"},"update":{"$set":{"price":69.99}}}
+- Delete (safe): {"operation":"deleteOne","collection":"products","queryString":"Remove discontinued product","filter":{"sku":"RMD-001"}}
+`;
 
     const messages = [new SystemMessage(systemPrompt), new HumanMessage(userQuery)];
-
     const response = await this.llm.invoke(messages);
 
     try {
-      const jsonMatch = response.content.toString().match(/\{[\s\S]*\}/);
+      const raw = response.content.toString();
+      const sanitizedText = this.sanitizeJsonContent(raw);
+      const jsonMatch = sanitizedText.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
         throw new Error('No valid JSON found in AI response');
       }
@@ -202,14 +207,12 @@ Examples:
         throw new Error('Invalid query object structure');
       }
 
-      // Handle date placeholders
       if (queryObject.filter) {
-        queryObject.filter = this.replaceDatePlaceholders(queryObject.filter);
+        queryObject.filter = this.postProcessFilter(queryObject.filter);
       }
 
-      // Ensure collection is specified
       if (!queryObject.collection) {
-        queryObject.collection = 'users'; // Default fallback
+        queryObject.collection = 'users';
       }
 
       return queryObject;
@@ -220,21 +223,21 @@ Examples:
   }
 
   private async generateSQLQuery(userQuery: string, schemaInfo: string, memoryContext: string, dbType: 'postgres' | 'mysql'): Promise<SQLQueryObject> {
-    const systemPrompt = `You are an advanced ${dbType.toUpperCase()} SQL query generator with user context awareness. Generate optimized SQL queries based on the user's natural language input, database schema, and their query history.
+    const systemPrompt = `You are a strict, safety-first ${dbType.toUpperCase()} SQL generator. Generate optimized and SAFE SQL (CRUD and analysis) from natural language, the database schema, and user history.
 
 Database Schema:
 ${schemaInfo}
 
 ${memoryContext}
 
-Rules:
-1. Generate only valid ${dbType.toUpperCase()} SQL queries for the available tables
-2. Use appropriate SQL operators and functions
-3. Always exclude password and sensitive fields in SELECT statements
-4. Consider the user's skill level and previous query patterns
-5. For beginners, prefer simpler queries; for advanced users, suggest more complex operations
-6. Use parameterized queries when appropriate
-7. Return the response in this exact JSON format:
+Strong Safety Rules:
+1) ALWAYS use parameterized queries. For Postgres use $1,$2,... and for MySQL use ? placeholders.
+2) NEVER generate DELETE without a highly specific WHERE clause. Forbid mass deletions.
+3) NEVER generate UPDATE without a highly specific WHERE clause.
+4) NEVER drop or truncate tables, or alter schema.
+5) ALWAYS exclude sensitive fields (password, accessToken, secrets) in SELECT/INSERT/UPDATE.
+6) Prefer LIMIT for reads.
+7) Return the response in this exact JSON format:
 
 {
   "operation": "sql",
@@ -251,14 +254,17 @@ Important:
 - Exclude sensitive fields like passwords
 
 Examples:
-- "Get all users" → {"operation": "sql", "queryString": "Find all users", "sql": "SELECT id, name, email, created_at FROM users", "parameters": []}
-- "Find user with email john@example.com" → {"operation": "sql", "queryString": "Find user by email", "sql": "SELECT id, name, email FROM users WHERE email = $1", "parameters": ["john@example.com"]}`;
+- Read: {"operation": "sql", "queryString": "Find all users", "sql": "SELECT id, name, email, created_at FROM users LIMIT 10", "parameters": []}
+- Update (safe): {"operation": "sql", "queryString": "Update product price", "sql": "UPDATE products SET price = $1 WHERE sku = $2", "parameters": [69.99, "RMD-001"]}
+- Delete (safe): {"operation": "sql", "queryString": "Delete discontinued product", "sql": "DELETE FROM products WHERE sku = $1", "parameters": ["RMD-001"]}`;
 
     const messages = [new SystemMessage(systemPrompt), new HumanMessage(userQuery)];
     const response = await this.llm.invoke(messages);
 
     try {
-      const jsonMatch = response.content.toString().match(/\{[\s\S]*\}/);
+      const raw = response.content.toString();
+      const sanitizedText = this.sanitizeJsonContent(raw);
+      const jsonMatch = sanitizedText.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
         throw new Error('No valid JSON found in AI response');
       }
@@ -308,23 +314,81 @@ Examples:
     return processValue(filter);
   }
 
+  // Convert common non-JSON tokens produced by LLM into proper JSON
+  private sanitizeJsonContent(text: string): string {
+    return text
+      .replace(/ObjectId\("([0-9a-fA-F]{24})"\)/g, '"$1"')
+      .replace(/new Date\("([^"]+)"\)/g, '"$1"')
+      .replace(/\bTrue\b/g, 'true')
+      .replace(/\bFalse\b/g, 'false');
+  }
+
+  // Post-process filter: convert placeholders and typed strings into proper types
+  private postProcessFilter(filter: any): any {
+    const processed = this.replaceDatePlaceholders(filter);
+    // Convert stringified ObjectId-like fields to actual ObjectId if safe
+    const convert = (obj: any): any => {
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        for (const key of Object.keys(obj)) {
+          const val = obj[key];
+          if (typeof val === 'string' && /^[0-9a-fA-F]{24}$/.test(val)) {
+            try {
+              obj[key] = new (mongoose as any).Types.ObjectId(val);
+            } catch {
+              /* ignore */
+            }
+          } else if (typeof val === 'object') {
+            obj[key] = convert(val);
+          }
+        }
+      } else if (Array.isArray(obj)) {
+        return obj.map(v => convert(v));
+      }
+      return obj;
+    };
+    return convert(processed);
+  }
+
   private async executeQuery(queryObj: MongoQueryObject | SQLQueryObject, dbConnection: any): Promise<any> {
     logger.info(`Executing ${queryObj.operation} query: ${queryObj.queryString}`);
 
     try {
       if (queryObj.operation === 'sql') {
         const sqlQuery = queryObj as SQLQueryObject;
+        // Guardrail: block dangerous SQL verbs
+        const lowerSql = (sqlQuery.sql || '').toLowerCase();
+        if (/\b(drop|truncate|alter)\b/.test(lowerSql)) {
+          throw new Error('Dangerous SQL operation blocked');
+        }
+
+        // Guardrail: prevent mass UPDATE/DELETE without WHERE
+        if (/^\s*delete\b/.test(lowerSql) && !/\bwhere\b/.test(lowerSql)) {
+          throw new Error('DELETE without WHERE is blocked');
+        }
+        if (/^\s*update\b/.test(lowerSql) && !/\bwhere\b/.test(lowerSql)) {
+          throw new Error('UPDATE without WHERE is blocked');
+        }
+
         if (dbConnection.type === 'postgres') {
           const result = await dbConnection.pg.query(sqlQuery.sql, sqlQuery.parameters || []);
           return result.rows;
         } else if (dbConnection.type === 'mysql') {
-          const [rows] = await dbConnection.mysql.execute(sqlQuery.sql, sqlQuery.parameters || []);
+          // Normalize Postgres-style params ($1,$2,...) to MySQL (?) if needed
+          let sql = sqlQuery.sql;
+          if (/\$\d+/.test(sql)) {
+            const paramCount = (sql.match(/\$\d+/g) || []).length;
+            sql = sql.replace(/\$\d+/g, '?');
+            if ((sqlQuery.parameters || []).length !== paramCount) {
+              throw new Error('Parameter count mismatch after normalization');
+            }
+          }
+          const [rows] = await dbConnection.mysql.execute(sql, sqlQuery.parameters || []);
           return rows;
         }
       } else {
         // MongoDB query
         const mongoQuery = queryObj as MongoQueryObject;
-        const { operation, collection, filter = {}, projection = { password: 0 }, sort, limit } = mongoQuery;
+        const { operation, collection, filter = {}, projection = { password: 0 }, sort, limit, document, update } = mongoQuery;
         
         // Get the appropriate model
         const model = this.getModelForCollection(collection, dbConnection.mongo);
@@ -343,8 +407,26 @@ Examples:
             return await model.countDocuments(filter).exec();
 
           case 'aggregate':
-            const pipeline = filter.pipeline || [{ $match: filter }];
+            const pipeline = (mongoQuery as any).pipeline || filter.pipeline || [{ $match: filter }];
+            // Guardrail: forbid $out / $merge
+            if (Array.isArray(pipeline) && pipeline.some((st: any) => st.$out || st.$merge)) {
+              throw new Error('Dangerous Mongo aggregation stage blocked');
+            }
             return await model.aggregate(pipeline).exec();
+
+          case 'insertOne':
+            if (!document || typeof document !== 'object') throw new Error('insertOne requires a document');
+            if ('password' in document) delete (document as any).password;
+            return await model.create(document);
+
+          case 'updateOne':
+            if (!filter || Object.keys(filter).length === 0) throw new Error('updateOne requires a specific filter');
+            if (!update || typeof update !== 'object') throw new Error('updateOne requires an update object');
+            return await model.updateOne(filter, update, { upsert: false });
+
+          case 'deleteOne':
+            if (!filter || Object.keys(filter).length === 0) throw new Error('deleteOne requires a specific filter');
+            return await model.deleteOne(filter);
 
           default:
             throw new Error(`Unsupported operation: ${operation}`);
@@ -385,6 +467,11 @@ Examples:
       'Show me all tables',
       'Get all records from products table',
       'Find orders from last month',
+      // CRUD + Analysis examples
+      'Create a new product named Remede Serum with price 59.99',
+      'Update the price of product with SKU RMD-001 to 69.99',
+      'Delete the product with SKU RMD-001',
+      'Show top 5 products by revenue in last 30 days',
     ];
   }
 
