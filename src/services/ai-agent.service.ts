@@ -11,6 +11,29 @@ import { QueryResult, MongoQueryObject, SQLQueryObject, DBType } from '@interfac
 import { logger } from '@utils/logger';
 import mongoose from 'mongoose';
 
+type PlanStep =
+  | {
+      type: 'db_query';
+      description?: string;
+      subQuery: string;
+    }
+  | {
+      type: 'compute_statistics';
+      description?: string;
+      onStep: number; // index of previous step to analyze
+      operations?: string[]; // e.g., ["count", "topk:field:5", "mean:price"]
+    }
+  | {
+      type: 'llm_analysis';
+      description?: string;
+      onSteps: number[]; // indices of steps to analyze
+      instructions?: string;
+    };
+
+interface ExecutionPlan {
+  steps: PlanStep[];
+}
+
 interface DBConnectionOptions {
   dbUrl: string;
   dbType?: DBType;
@@ -53,6 +76,40 @@ export class AIAgentService {
       // Get memory insights for the user
       const memoryInsights = await this.memoryService.getMemoryInsights(userId, userQuery);
 
+      // Early exit for greetings/small talk without hitting the database
+      if (this.isGreeting(userQuery)) {
+        const executionTime = Date.now() - startTime;
+        const politeMessage = await this.composeGeneralResponse(userQuery, memoryInsights);
+
+        try {
+          await this.memoryService.recordQuery(
+            userId,
+            userQuery,
+            'Conversation detected: no database query executed',
+            'find',
+            ['n/a'],
+            executionTime,
+            0,
+            true,
+          );
+        } catch (memErr: any) {
+          logger.warn(`Memory record (conversation) failed: ${memErr.message}`);
+        }
+
+        return {
+          data: null,
+          message: politeMessage,
+          query: undefined,
+          suggestions: memoryInsights.suggestions,
+          executionTime,
+          memoryInsights: {
+            similarQueries: memoryInsights.similarQueries.length,
+            userLevel: memoryInsights.userPreferences?.learningProfile?.skillLevel || 'beginner',
+            queryPattern: memoryInsights.queryPattern,
+          },
+        };
+      }
+
       // Get dynamic database schema
       let schemaInfo: string;
       if (dbConnection.type === 'mongodb') {
@@ -65,31 +122,72 @@ export class AIAgentService {
         );
       }
 
-      // Generate query using AI with memory context
-      const queryObject = await this.generateQuery(userQuery, schemaInfo, memoryInsights, dbConnection.type);
+      // Plan → Execute workflow
+      let plan: ExecutionPlan | null = null;
+      let finalData: any = null;
+      let executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }> = [];
+      let toolOutputs: Array<{ stepIndex: number; type: string; output: any }> = [];
 
-      // Execute the generated query
-      const result = await this.executeQuery(queryObject, dbConnection);
+      try {
+        plan = await this.planExecution(userQuery, schemaInfo, memoryInsights, dbConnection.type);
+        const execution = await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery);
+        finalData = execution.finalData;
+        executedQueries = execution.executedQueries;
+        toolOutputs = execution.toolOutputs;
+      } catch (planError: any) {
+        logger.warn(`Plan-execute flow failed, falling back to single-shot: ${planError.message}`);
+        // Fallback to single-shot query generation
+        const queryObject = await this.generateQuery(userQuery, schemaInfo, memoryInsights, dbConnection.type);
+        const result = await this.executeQuery(queryObject, dbConnection);
+        finalData = result;
+        executedQueries = [{ queryObject, result }];
+      }
 
       const executionTime = Date.now() - startTime;
-      const resultCount = Array.isArray(result) ? result.length : result ? 1 : 0;
+      const resultCount = Array.isArray(finalData) ? finalData.length : finalData ? 1 : 0;
 
       // Record this query in memory
-      await this.memoryService.recordQuery(
-        userId,
-        userQuery,
-        queryObject.queryString,
-        queryObject.operation as any,
-        dbConnection.type === 'mongodb' ? [(queryObject as MongoQueryObject).collection || 'unknown'] : ['sql_table'],
-        executionTime,
-        resultCount,
-        true,
-      );
+      try {
+        if (executedQueries.length > 0) {
+          const first = executedQueries[0].queryObject;
+          await this.memoryService.recordQuery(
+            userId,
+            userQuery,
+            first.queryString,
+            (first as any).operation,
+            dbConnection.type === 'mongodb' ? [((first as MongoQueryObject).collection || 'unknown')] : ['sql_table'],
+            executionTime,
+            resultCount,
+            true,
+          );
+        } else {
+          await this.memoryService.recordQuery(
+            userId,
+            userQuery,
+            'Plan executed without direct DB query',
+            'find',
+            ['n/a'],
+            executionTime,
+            resultCount,
+            true,
+          );
+        }
+      } catch (memErr: any) {
+        logger.warn(`Memory record failed: ${memErr.message}`);
+      }
+
+      // Generate final response message using LLM if we have tool outputs; otherwise default
+      let finalMessage = 'Query executed successfully';
+      try {
+        finalMessage = await this.generateFinalResponseMessage(userQuery, executedQueries, toolOutputs, memoryInsights);
+      } catch (composeErr: any) {
+        logger.warn(`Failed to compose final response, using default message: ${composeErr.message}`);
+      }
 
       return {
-        data: result,
-        message: 'Query executed successfully',
-        query: queryObject.queryString,
+        data: finalData,
+        message: finalMessage,
+        query: executedQueries[0]?.queryObject?.queryString,
         suggestions: memoryInsights.suggestions,
         executionTime,
         memoryInsights: {
@@ -111,6 +209,248 @@ export class AIAgentService {
       logger.error(`AI Agent error for user ${userId}: ${error.message}`);
       throw new HttpException(500, `AI Agent failed: ${error.message}`);
     }
+  }
+
+  private isGreeting(input: string): boolean {
+    const text = (input || '').trim().toLowerCase();
+    if (!text) return false;
+    const patterns = [
+      /^(hi|hello|hey|yo|sup)[!,. ]*$/,
+      /^(good\s*(morning|afternoon|evening))\b/,
+      /^(how\s*are\s*you)\b/,
+      /^thanks?\b/,
+      /^thank\s*you\b/,
+      /^what'?s\s*up\b/,
+    ];
+    return patterns.some(rx => rx.test(text));
+  }
+
+  private async composeGeneralResponse(userQuery: string, memoryInsights: any): Promise<string> {
+    const prompt = `You are a mature, helpful assistant. The user message appears to be greeting or small talk.
+
+User: "${userQuery}"
+User preferences: ${JSON.stringify(memoryInsights?.userPreferences || {}, null, 2)}
+
+Respond briefly and warmly, offer help, and mention you can:
+- answer questions
+- query connected databases (when provided)
+- perform light data analysis and recommendations.
+Do not include raw data or technical details. Keep it to 1-2 short sentences.`;
+    const res = await this.llm.invoke([
+      new SystemMessage(prompt),
+      new HumanMessage('Please reply with 1-2 short sentences only.'),
+    ]);
+    return res.content.toString();
+  }
+
+  // Create a multi-step execution plan in JSON
+  private async planExecution(userQuery: string, schemaInfo: string, memoryInsights: any, dbType: DBType): Promise<ExecutionPlan> {
+    const toolsDescription = `Available Tools:
+1) db_query: Generate and execute a single ${dbType.toUpperCase()} or MongoDB query for a sub-goal. Input: { "subQuery": string }
+2) compute_statistics: Compute quick stats on prior step results (arrays of objects). Input: { "onStep": number, "operations"?: string[] }
+3) llm_analysis: Use the LLM to analyze results and produce insights or recommendations. Input: { "onSteps": number[], "instructions"?: string }`;
+
+    const planningPrompt = `You are a senior data agent. Create a concise step-by-step plan to fulfill the user's request by selecting from the available tools.
+
+User Query:\n"${userQuery}"
+
+Database Schema:\n${schemaInfo}
+
+User Context:\n${JSON.stringify(memoryInsights || {}, null, 2)}
+
+${toolsDescription}
+
+Rules:
+- Prefer a single db_query step when sufficient.
+- For analysis or recommendations, first fetch relevant data (db_query), then compute_statistics if numeric/categorical summaries help, and optionally do llm_analysis to explain/advise.
+- Keep the plan minimal but sufficient.
+- Output strictly valid JSON in this schema:
+{
+  "steps": [
+    { "type": "db_query", "description": "...", "subQuery": "..." },
+    { "type": "compute_statistics", "onStep": 0, "operations": ["count", "topk:field:5"] },
+    { "type": "llm_analysis", "onSteps": [0,1], "instructions": "Explain insights and give recommendations" }
+  ]
+}`;
+
+    const response = await this.llm.invoke([
+      new SystemMessage(planningPrompt),
+      new HumanMessage('Return only the JSON object for the plan.'),
+    ]);
+    const raw = response.content.toString();
+    const sanitized = this.sanitizeJsonContent(raw);
+    const match = sanitized.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('Planning failed: No JSON found');
+    const parsed = JSON.parse(match[0]);
+    if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('Planning failed: Invalid plan structure');
+    return parsed as ExecutionPlan;
+  }
+
+  // Execute plan steps in order
+  private async executePlannedSteps(
+    plan: ExecutionPlan,
+    dbConnection: any,
+    schemaInfo: string,
+    memoryInsights: any,
+    userQuery: string,
+  ): Promise<{
+    finalData: any;
+    executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }>;
+    toolOutputs: Array<{ stepIndex: number; type: string; output: any }>;
+  }> {
+    const executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }> = [];
+    const toolOutputs: Array<{ stepIndex: number; type: string; output: any }> = [];
+    const stepResults: any[] = [];
+
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i] as PlanStep;
+      try {
+        if (step.type === 'db_query') {
+          const subQuery = (step as Extract<PlanStep, { type: 'db_query' }>).subQuery || userQuery;
+          const queryObject = await this.generateQuery(subQuery, schemaInfo, memoryInsights, dbConnection.type);
+          const result = await this.executeQuery(queryObject, dbConnection);
+          executedQueries.push({ queryObject, result });
+          stepResults[i] = result;
+          toolOutputs.push({ stepIndex: i, type: 'db_query', output: { query: queryObject.queryString, rows: this.previewArray(result) } });
+        } else if (step.type === 'compute_statistics') {
+          const onIndex = (step as Extract<PlanStep, { type: 'compute_statistics' }>).onStep;
+          const base = stepResults[onIndex];
+          const ops = (step as Extract<PlanStep, { type: 'compute_statistics' }>).operations || ['count'];
+          const stats = this.computeQuickStatistics(base, ops);
+          stepResults[i] = stats;
+          toolOutputs.push({ stepIndex: i, type: 'compute_statistics', output: stats });
+        } else if (step.type === 'llm_analysis') {
+          const onSteps = (step as Extract<PlanStep, { type: 'llm_analysis' }>).onSteps || [];
+          const instructions = (step as Extract<PlanStep, { type: 'llm_analysis' }>).instructions || 'Analyze the results and provide insights.';
+          const picked = onSteps.map(idx => stepResults[idx]);
+          const analysis = await this.performLLMAnalysis(userQuery, picked, instructions);
+          stepResults[i] = analysis;
+          toolOutputs.push({ stepIndex: i, type: 'llm_analysis', output: analysis });
+        }
+      } catch (err: any) {
+        logger.warn(`Step ${i} (${(step as any).type}) failed: ${err.message}`);
+        stepResults[i] = { error: err.message };
+        toolOutputs.push({ stepIndex: i, type: 'error', output: err.message });
+      }
+    }
+
+    // Choose final data: prefer last db_query result; else last step result
+    let finalData: any = null;
+    for (let i = plan.steps.length - 1; i >= 0; i--) {
+      if (plan.steps[i].type === 'db_query') {
+        finalData = stepResults[i];
+        break;
+      }
+    }
+    if (finalData == null && plan.steps.length > 0) {
+      finalData = stepResults[plan.steps.length - 1];
+    }
+
+    return { finalData, executedQueries, toolOutputs };
+  }
+
+  private previewArray(value: any, limit = 10): any {
+    if (Array.isArray(value)) return value.slice(0, limit);
+    return value;
+  }
+
+  private computeQuickStatistics(data: any, operations: string[]): any {
+    const result: any = {};
+    const arr = Array.isArray(data) ? data : [];
+    const columns = this.inferColumns(arr);
+
+    for (const opRaw of operations) {
+      const op = String(opRaw || '').toLowerCase();
+      if (op === 'count') {
+        result.count = arr.length;
+      } else if (op.startsWith('topk:')) {
+        const [, field, kStr] = op.split(':');
+        const k = Math.max(1, Math.min(50, parseInt(kStr || '5', 10)));
+        const freq: Record<string, number> = {};
+        for (const row of arr) {
+          const v = row?.[field];
+          if (v != null) freq[String(v)] = (freq[String(v)] || 0) + 1;
+        }
+        result[`topk_${field}`] = Object.entries(freq)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, k)
+          .map(([val, cnt]) => ({ value: val, count: cnt }));
+      } else if (op.startsWith('mean:') || op.startsWith('avg:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        const mean = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+        result[`mean_${field}`] = mean;
+      } else if (op.startsWith('min:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        result[`min_${field}`] = nums.length ? Math.min(...nums) : null;
+      } else if (op.startsWith('max:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        result[`max_${field}`] = nums.length ? Math.max(...nums) : null;
+      } else if (op.startsWith('sum:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        result[`sum_${field}`] = nums.length ? nums.reduce((a, b) => a + b, 0) : 0;
+      } else if (op.startsWith('distinct:')) {
+        const field = op.split(':')[1];
+        const set = new Set<string>();
+        for (const row of arr) if (row && row[field] != null) set.add(String(row[field]));
+        result[`distinct_${field}`] = Array.from(set);
+      }
+    }
+    result.columns = columns;
+    return result;
+  }
+
+  private inferColumns(rows: any[]): string[] {
+    const set = new Set<string>();
+    for (const row of rows) if (row && typeof row === 'object') for (const k of Object.keys(row)) set.add(k);
+    return Array.from(set);
+  }
+
+  private async performLLMAnalysis(userQuery: string, datasets: any[], instructions: string): Promise<string> {
+    const sample = datasets.map(ds => (Array.isArray(ds) ? ds.slice(0, 20) : ds));
+    const prompt = `User query: "${userQuery}"
+
+We have the following datasets (JSON previews, truncated to first 20 rows each):
+${sample.map((s, idx) => `Dataset ${idx}:\n${JSON.stringify(s, null, 2)}`).join('\n\n')}
+
+Instructions: ${instructions}
+
+Provide a concise analysis and, if applicable, recommendations grounded in the data. Do not include raw JSON in the final message.`;
+    const res = await this.llm.invoke([
+      new SystemMessage(prompt),
+      new HumanMessage('Provide a concise analysis and recommendations.'),
+    ]);
+    return res.content.toString();
+  }
+
+  private async generateFinalResponseMessage(
+    userQuery: string,
+    executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }>,
+    toolOutputs: Array<{ stepIndex: number; type: string; output: any }>,
+    memoryInsights: any,
+  ): Promise<string> {
+    const querySummaries = executedQueries.map((q, i) => ({ index: i, description: q.queryObject.queryString, rows: Array.isArray(q.result) ? q.result.length : (q.result ? 1 : 0) }));
+    const previewOutputs = toolOutputs.slice(-5); // last few tool outputs
+    const prompt = `Summarize the results for the user.
+
+User Query: "${userQuery}"
+Executed Queries: ${JSON.stringify(querySummaries)}
+Recent Tool Outputs: ${JSON.stringify(previewOutputs)}
+User Preferences: ${JSON.stringify(memoryInsights?.userPreferences || {}, null, 2)}
+
+Guidelines:
+- Be direct and clear.
+- If analysis/recommendations are available, include them briefly.
+- Avoid raw JSON; present findings in plain language.
+`;
+    const res = await this.llm.invoke([
+      new SystemMessage(prompt),
+      new HumanMessage('Write a short final message for the user.'),
+    ]);
+    return res.content.toString();
   }
 
   private async generateQuery(userQuery: string, schemaInfo: string, memoryInsights: any, dbType: DBType): Promise<MongoQueryObject | SQLQueryObject> {

@@ -63,6 +63,16 @@ export class DatabaseAgentService {
 
   public async processMessage(message: string, userId: string, _sessionId: string, conversationHistory: any[] = []): Promise<AgentResponse> {
     try {
+      // Handle greetings/small talk upfront with no DB actions
+      if (this.isGreeting(message)) {
+        const polite = await this.composeGeneralResponse(message, userId);
+        return {
+          message: polite,
+          type: 'text',
+          confidence: 0.9,
+        };
+      }
+
       // Initialize the agent state
       const initialState: AgentState = {
         messages: [new HumanMessage(message)],
@@ -95,6 +105,44 @@ export class DatabaseAgentService {
     }
   }
 
+  private isGreeting(input: string): boolean {
+    const text = (input || '').trim().toLowerCase();
+    if (!text) return false;
+    const patterns = [
+      /^(hi|hello|hey|yo|sup)[!,. ]*$/,
+      /^(good\s*(morning|afternoon|evening))\b/,
+      /^(how\s*are\s*you)\b/,
+      /^thanks?\b/,
+      /^thank\s*you\b/,
+      /^what'?s\s*up\b/,
+    ];
+    return patterns.some(rx => rx.test(text));
+  }
+
+  private async composeGeneralResponse(message: string, userId: string): Promise<string> {
+    try {
+      const memoryService = this.memoryService;
+      const insights = await memoryService.getMemoryInsights(userId, message);
+      const prompt = `You are a mature, helpful assistant. The user message appears to be greeting or small talk.
+
+User: "${message}"
+User preferences: ${JSON.stringify(insights?.userPreferences || {}, null, 2)}
+
+Respond briefly and warmly (1-2 short sentences). Offer help and mention you can:
+- answer questions
+- query connected databases
+- perform light data analysis and recommendations.
+Do not include any raw data or technical details.`;
+      const res = await this.llm.invoke([
+        new SystemMessage(prompt),
+        new HumanMessage('Please reply with 1-2 short sentences only.'),
+      ]);
+      return res.content.toString();
+    } catch (e: any) {
+      return 'Hi! How can I help you today? I can answer questions or analyze your data.';
+    }
+  }
+
   private async analyzeQuery(state: AgentState): Promise<Partial<AgentState>> {
     const query = state.currentQuery || '';
     const thinking = `Analyzing user query: "${query}"`;
@@ -110,6 +158,7 @@ export class DatabaseAgentService {
 4. Expected response type
 
 Query: "${query}"`),
+      new HumanMessage('Return a short analysis.'),
     ]);
 
     return {
@@ -156,7 +205,10 @@ ${state.tools.map(tool => `- ${tool.name}: ${tool.description}`).join('\n')}
 
 Create a step-by-step plan to answer the user's query effectively.`;
 
-    const plan = await this.llm.invoke([new SystemMessage(planningPrompt)]);
+    const plan = await this.llm.invoke([
+      new SystemMessage(planningPrompt),
+      new HumanMessage('Return only the plan text.'),
+    ]);
 
     return {
       thinking,
@@ -186,7 +238,10 @@ ${tools.map(tool => `${tool.name}: ${tool.description}`).join('\n')}
 
 Execute the necessary database operations to answer the user's query.`;
 
-      const toolDecision = await this.llm.invoke([new SystemMessage(toolSelectionPrompt)]);
+      const toolDecision = await this.llm.invoke([
+        new SystemMessage(toolSelectionPrompt),
+        new HumanMessage('Return tool calls in a machine-readable way.'),
+      ]);
 
       // Parse and execute tools based on the decision
       const toolsToExecute = this.parseToolExecution(toolDecision.content.toString());
@@ -241,7 +296,10 @@ Provide a clear, helpful response that:
 
 Response format should be conversational and user-friendly.`;
 
-    const response = await this.llm.invoke([new SystemMessage(responsePrompt)]);
+    const response = await this.llm.invoke([
+      new SystemMessage(responsePrompt),
+      new HumanMessage('Write a concise, friendly response.'),
+    ]);
 
     const finalResponse: AgentResponse = {
       message: response.content.toString(),
