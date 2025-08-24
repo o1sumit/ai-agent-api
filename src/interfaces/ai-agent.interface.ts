@@ -4,6 +4,8 @@ export interface AIQueryRequest {
   query: string;
   dbUrl: string;
   dbType?: DBType;
+  dryRun?: boolean;
+  refreshSchema?: boolean;
 }
 
 export interface AIQueryResponse {
@@ -27,6 +29,9 @@ export interface QueryResult {
   suggestions?: string[];
   executionTime?: number;
   memoryInsights?: MemoryInsights;
+  plan?: any;
+  trace?: Array<{ stepIndex: number; type: string; output: any }>;
+  executedQueries?: Array<{ operation: string; queryString: string; sql?: string; collection?: string; filter?: any }>;
 }
 
 export interface MemoryInsights {

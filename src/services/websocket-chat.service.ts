@@ -123,7 +123,7 @@ export class WebSocketChatService {
       // Handle sending messages
       socket.on('send-message', async (data: WebSocketEvents['send-message']) => {
         try {
-          const { message, sessionId, dbUrl, dbType } = data;
+          const { message, sessionId, dbUrl, dbType, dryRun } = data;
           const userId = socket.userId;
 
           // Validate session access
@@ -160,14 +160,17 @@ export class WebSocketChatService {
           if (dbUrl) {
             // If DB URL provided in chat, route to the new AI Agent multi-DB flow directly
             const aiAgent = new (require('./ai-agent.service').AIAgentService)();
-            const result = await aiAgent.processQuery(message, userId, { dbUrl, dbType: dbType as any });
+            const result = await aiAgent.processQuery(message, userId, { dbUrl, dbType: dbType as any, dryRun });
             agentResponse = {
-              message: typeof result?.data === 'object' ? JSON.stringify(result.data) : String(result?.data ?? ''),
-              type: 'data',
+              message: result.message || (typeof result?.data === 'object' ? JSON.stringify(result.data) : String(result?.data ?? '')),
+              type: dryRun ? 'text' : 'data',
               data: result.data,
               toolsUsed: ['ai-agent'],
               executionTime: result.executionTime,
               confidence: 0.8,
+              plan: result.plan,
+              trace: result.trace,
+              executedQueries: result.executedQueries,
             } as any;
           } else {
             // Fallback to the existing database agent workflow

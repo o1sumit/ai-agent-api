@@ -10,6 +10,7 @@ import { AIMemoryService } from './ai-memory.service';
 import { QueryResult, MongoQueryObject, SQLQueryObject, DBType } from '@interfaces/ai-agent.interface';
 import { logger } from '@utils/logger';
 import mongoose from 'mongoose';
+import { SchemaRegistryService } from './schema-registry.service';
 
 type PlanStep =
   | {
@@ -37,6 +38,7 @@ interface ExecutionPlan {
 interface DBConnectionOptions {
   dbUrl: string;
   dbType?: DBType;
+  refreshSchema?: boolean;
 }
 
 @Service()
@@ -46,6 +48,7 @@ export class AIAgentService {
   private sqlSchemaDetector: SQLSchemaDetectorService;
   private dbPool: DbPoolService;
   private memoryService: AIMemoryService;
+  private schemaRegistry: SchemaRegistryService;
 
   constructor() {
     if (!GOOGLE_API_KEY) {
@@ -62,9 +65,10 @@ export class AIAgentService {
     this.sqlSchemaDetector = new SQLSchemaDetectorService();
     this.dbPool = new DbPoolService();
     this.memoryService = new AIMemoryService();
+    this.schemaRegistry = new SchemaRegistryService();
   }
 
-  public async processQuery(userQuery: string, userId: string, dbOptions: DBConnectionOptions): Promise<QueryResult> {
+  public async processQuery(userQuery: string, userId: string, dbOptions: DBConnectionOptions & { dryRun?: boolean }): Promise<QueryResult> {
     const startTime = Date.now();
 
     try {
@@ -110,17 +114,13 @@ export class AIAgentService {
         };
       }
 
-      // Get dynamic database schema
-      let schemaInfo: string;
-      if (dbConnection.type === 'mongodb') {
-        const schemas = await this.schemaDetector.getAllSchemas(dbConnection.mongo);
-        schemaInfo = this.schemaDetector.getSchemaAsString(schemas);
-      } else {
-        schemaInfo = await this.sqlSchemaDetector.getSchemaAsString(
-          dbConnection.type,
-          dbConnection.type === 'postgres' ? dbConnection.pg : dbConnection.mysql
-        );
-      }
+      // Get database schema from persistent registry (build if missing/stale)
+      const schemaInfo = await this.schemaRegistry.getOrBuildSchemaString(
+        dbOptions.dbUrl,
+        dbConnection.type,
+        dbConnection,
+        dbOptions.refreshSchema === true,
+      );
 
       // Plan → Execute workflow
       let plan: ExecutionPlan | null = null;
@@ -130,17 +130,33 @@ export class AIAgentService {
 
       try {
         plan = await this.planExecution(userQuery, schemaInfo, memoryInsights, dbConnection.type);
-        const execution = await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery);
-        finalData = execution.finalData;
-        executedQueries = execution.executedQueries;
-        toolOutputs = execution.toolOutputs;
+        if (dbOptions.dryRun) {
+          // Only preview: synthesize executedQueries list by generating queries without executing
+          for (let i = 0; i < plan.steps.length; i++) {
+            const step = plan.steps[i] as PlanStep;
+            if (step.type === 'db_query') {
+              const subQuery = (step as any).subQuery || userQuery;
+              const queryObject = await this.generateQuery(subQuery, schemaInfo, memoryInsights, dbConnection.type);
+              executedQueries.push({ queryObject, result: null });
+            }
+          }
+        } else {
+          const execution = await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery);
+          finalData = execution.finalData;
+          executedQueries = execution.executedQueries;
+          toolOutputs = execution.toolOutputs;
+        }
       } catch (planError: any) {
         logger.warn(`Plan-execute flow failed, falling back to single-shot: ${planError.message}`);
         // Fallback to single-shot query generation
         const queryObject = await this.generateQuery(userQuery, schemaInfo, memoryInsights, dbConnection.type);
-        const result = await this.executeQuery(queryObject, dbConnection);
-        finalData = result;
-        executedQueries = [{ queryObject, result }];
+        if (dbOptions.dryRun) {
+          executedQueries = [{ queryObject, result: null }];
+        } else {
+          const result = await this.executeQuery(queryObject, dbConnection);
+          finalData = result;
+          executedQueries = [{ queryObject, result }];
+        }
       }
 
       const executionTime = Date.now() - startTime;
@@ -177,7 +193,7 @@ export class AIAgentService {
       }
 
       // Generate final response message using LLM if we have tool outputs; otherwise default
-      let finalMessage = 'Query executed successfully';
+      let finalMessage = dbOptions.dryRun ? 'Preview generated successfully' : 'Query executed successfully';
       try {
         finalMessage = await this.generateFinalResponseMessage(userQuery, executedQueries, toolOutputs, memoryInsights);
       } catch (composeErr: any) {
@@ -190,6 +206,15 @@ export class AIAgentService {
         query: executedQueries[0]?.queryObject?.queryString,
         suggestions: memoryInsights.suggestions,
         executionTime,
+        plan,
+        trace: toolOutputs,
+        executedQueries: executedQueries.map(eq => {
+          const base: any = { operation: (eq.queryObject as any).operation, queryString: (eq.queryObject as any).queryString };
+          if ((eq.queryObject as any).sql) base.sql = (eq.queryObject as any).sql;
+          if ((eq.queryObject as any).collection) base.collection = (eq.queryObject as any).collection;
+          if ((eq.queryObject as any).filter) base.filter = (eq.queryObject as any).filter;
+          return base;
+        }),
         memoryInsights: {
           similarQueries: memoryInsights.similarQueries.length,
           userLevel: memoryInsights.userPreferences?.learningProfile?.skillLevel || 'beginner',

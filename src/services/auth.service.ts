@@ -30,7 +30,7 @@ export class AuthService {
     return createUserData;
   }
 
-  public async login(userData: User): Promise<{ cookie: string; findUser: User }> {
+  public async login(userData: User): Promise<{ cookie: string; token: string; findUser: User }> {
     const findUser: User = await UserModel.findOne({ email: userData.email });
     if (!findUser) throw new HttpException(409, `This email ${userData.email} was not found`);
 
@@ -40,7 +40,7 @@ export class AuthService {
     const tokenData = createToken(findUser);
     const cookie = createCookie(tokenData);
 
-    return { cookie, findUser };
+    return { cookie, token: tokenData.token, findUser };
   }
 
   public async logout(userData: User): Promise<User> {

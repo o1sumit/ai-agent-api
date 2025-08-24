@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, MinLength, MaxLength, IsIn, IsOptional } from 'class-validator';
+import { IsString, IsNotEmpty, MinLength, MaxLength, IsIn, IsOptional, IsBoolean } from 'class-validator';
 
 export class AIQueryDto {
   @IsString()
@@ -15,6 +15,10 @@ export class AIQueryDto {
   @IsOptional()
   @IsIn(['mongodb', 'postgres', 'mysql'])
   public dbType?: 'mongodb' | 'postgres' | 'mysql';
+
+  @IsBoolean()
+  @IsOptional()
+  public refreshSchema?: boolean;
 }
 
 export class AIFeedbackDto {

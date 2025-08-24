@@ -108,6 +108,9 @@
             <textarea id="message" placeholder="Ask: Update price to 69.99 where sku is RMD-001"></textarea>
           </div>
           <div class="col-12 actions">
+            <label style="display:flex;align-items:center;gap:8px;color:#9ca3af;font-size:12px"><input type="checkbox" id="dryRun" /> Dry run (preview only)</label>
+            <button id="btnLogin" class="secondary">Login</button>
+            <button id="btnAuto" class="secondary">Auto Fill IDs</button>
             <button id="btnJoin">Join Session</button>
             <button id="btnSend">Send Message</button>
             <button id="btnTyping" class="secondary">Typing</button>
@@ -132,6 +135,13 @@
             <div class="actions"><button id="btnClearResp" class="secondary">Clear</button></div>
           </div>
           <pre id="responseLog" class="code"></pre>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h3>Plan & Trace</h3>
+            <div class="actions"><button id="btnClearPlan" class="secondary">Clear</button></div>
+          </div>
+          <pre id="planLog" class="code"></pre>
         </div>
       </div>
     </div>
