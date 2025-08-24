@@ -1,7 +1,7 @@
 import { Service } from 'typedi';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
-import { GOOGLE_API_KEY } from '@config';
+import { GOOGLE_API_KEY, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS, REDACT_SQL_IN_RESPONSES } from '@config';
 import { HttpException } from '@exceptions/httpException';
 import { SchemaDetectorService } from './schema-detector.service';
 import { SQLSchemaDetectorService } from './sql-schema-detector.service';
@@ -210,7 +210,7 @@ export class AIAgentService {
         trace: toolOutputs,
         executedQueries: executedQueries.map(eq => {
           const base: any = { operation: (eq.queryObject as any).operation, queryString: (eq.queryObject as any).queryString };
-          if ((eq.queryObject as any).sql) base.sql = (eq.queryObject as any).sql;
+          if ((eq.queryObject as any).sql) base.sql = REDACT_SQL_IN_RESPONSES ? '[redacted]' : (eq.queryObject as any).sql;
           if ((eq.queryObject as any).collection) base.collection = (eq.queryObject as any).collection;
           if ((eq.queryObject as any).filter) base.filter = (eq.queryObject as any).filter;
           return base;
@@ -747,8 +747,10 @@ Examples:
         sqlText = sqlText.replace(/;\s*$/, '');
 
         if (dbConnection.type === 'postgres') {
-          const result = await dbConnection.pg.query(sqlText, sqlQuery.parameters || []);
-          return result.rows;
+          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('SQL query timeout')), QUERY_TIMEOUT_MS));
+          const queryPromise = dbConnection.pg.query(sqlText, sqlQuery.parameters || []);
+          const result = await Promise.race([queryPromise, timeoutPromise]);
+          return (result as any).rows;
         } else if (dbConnection.type === 'mysql') {
           // Normalize Postgres-style params ($1,$2,...) to MySQL (?) if needed
           let sql = sqlText;
@@ -759,7 +761,10 @@ Examples:
               throw new Error('Parameter count mismatch after normalization');
             }
           }
-          const [rows] = await dbConnection.mysql.execute(sql, sqlQuery.parameters || []);
+          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('SQL query timeout')), QUERY_TIMEOUT_MS));
+          const execPromise = dbConnection.mysql.execute(sql, sqlQuery.parameters || []);
+          const result = await Promise.race([execPromise, timeoutPromise]);
+          const [rows] = result as any;
           return rows;
         }
       } else {
@@ -785,7 +790,7 @@ Examples:
           case 'find':
             let query = model.find(filter, projection);
             if (sort) query = query.sort(sort);
-            if (limit) query = query.limit(limit);
+            query = query.limit(Math.min(limit || DEFAULT_ROW_LIMIT, DEFAULT_ROW_LIMIT));
             return await query.exec();
 
           case 'findOne':
@@ -800,7 +805,12 @@ Examples:
             if (Array.isArray(pipeline) && pipeline.some((st: any) => st.$out || st.$merge)) {
               throw new Error('Dangerous Mongo aggregation stage blocked');
             }
-            return await model.aggregate(pipeline).exec();
+            const limitedPipeline = Array.isArray(pipeline) ? [...pipeline] : pipeline;
+            // Append limit if none exists
+            if (Array.isArray(limitedPipeline) && !limitedPipeline.some((st: any) => st.$limit)) {
+              limitedPipeline.push({ $limit: DEFAULT_ROW_LIMIT });
+            }
+            return await model.aggregate(limitedPipeline).exec();
 
           case 'insertOne':
             if (!document || typeof document !== 'object') throw new Error('insertOne requires a document');

@@ -24,6 +24,13 @@ Create .env.development.local with at least:
 SECRET_KEY=your-jwt-secret
 GOOGLE_API_KEY=your-google-gemini-api-key
 PORT=3000
+
+# Optional tuning
+SCHEMA_REGISTRY_TTL_MS=86400000        # default 24h
+DEFAULT_ROW_LIMIT=1000                 # cap for reads/aggregations
+QUERY_TIMEOUT_MS=15000                 # SQL execution timeout
+REDACT_SQL_IN_RESPONSES=false          # hide SQL text in responses
+PG_POOL_MAX=10                         # Postgres pool size
 ```
 
 3) Run in development
@@ -142,7 +149,7 @@ API Reference (Selected)
   - POST /login -> { token, data }
   - POST /signup, POST /logout
 - AI Agent
-  - POST /api/ai-agent/query { query, dbUrl, dbType?, dryRun? }
+  - POST /api/ai-agent/query { query, dbUrl, dbType?, dryRun?, refreshSchema? }
   - GET /api/ai-agent/status, GET /api/ai-agent/samples
 - WebSocket events
   - join-session { sessionId, userId }
@@ -168,4 +175,5 @@ npm run lint       # lint
 Notes
 - Configure Google API key in environment for LLM calls.
 - Provide valid dbUrl for the target database (Mongo/Postgres/MySQL).
+ - Persistent Schema Registry: the agent caches per-DB schema (hashed key, credentials stripped) and refreshes after TTL. You can force rebuild by sending `refreshSchema: true` in the request.
 

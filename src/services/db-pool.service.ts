@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 import { Pool as PgPool } from 'pg';
 import { createPool as createMysqlPool, Pool as MysqlPool } from 'mysql2/promise';
 import { logger } from '@utils/logger';
+import { PG_POOL_MAX, QUERY_TIMEOUT_MS } from '@config';
 import { DBType } from '@interfaces/ai-agent.interface';
 
 type ConnectionResult =
@@ -66,7 +67,7 @@ export class DbPoolService {
         const existing = this.pgPools.get(dbUrl);
         if (existing) return existing;
 
-        const pool = new PgPool({ connectionString: dbUrl });
+        const pool = new PgPool({ connectionString: dbUrl, max: PG_POOL_MAX, statement_timeout: QUERY_TIMEOUT_MS });
         this.pgPools.set(dbUrl, pool);
         return pool;
     }

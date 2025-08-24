@@ -122,7 +122,7 @@ const UserPreferencesSchema: Schema = new Schema(
 );
 
 // Indexes for better performance
-AIMemorySchema.index({ userId: 1, timestamp: -1 });
+AIMemorySchema.index({ userId: 1, createdAt: -1 });
 AIMemorySchema.index({ queryPattern: 1 });
 AIMemorySchema.index({ wasSuccessful: 1 });
 

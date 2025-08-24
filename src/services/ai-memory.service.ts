@@ -80,7 +80,7 @@ export class AIMemoryService {
         queryPattern,
         wasSuccessful: true,
       })
-        .sort({ timestamp: -1 })
+        .sort({ createdAt: -1 })
         .limit(3)
         .lean();
 
@@ -94,7 +94,7 @@ export class AIMemoryService {
           $or: [{ query: regexPattern }, { queryPattern: regexPattern }],
           wasSuccessful: true,
         })
-          .sort({ timestamp: -1 })
+          .sort({ createdAt: -1 })
           .limit(3)
           .lean();
       }

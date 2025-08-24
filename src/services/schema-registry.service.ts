@@ -4,12 +4,14 @@ import { SchemaDetectorService } from './schema-detector.service';
 import { SQLSchemaDetectorService } from './sql-schema-detector.service';
 import { DBType } from '@interfaces/ai-agent.interface';
 import { logger } from '@utils/logger';
+import crypto from 'crypto';
+import { SCHEMA_REGISTRY_TTL_MS } from '@config';
 
 @Service()
 export class SchemaRegistryService {
   private schemaDetector = new SchemaDetectorService();
   private sqlSchemaDetector = new SQLSchemaDetectorService();
-  private DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+  private DEFAULT_TTL_MS = SCHEMA_REGISTRY_TTL_MS;
 
   public async getOrBuildSchemaString(
     dbUrl: string,
@@ -18,7 +20,7 @@ export class SchemaRegistryService {
     forceRefresh = false,
   ): Promise<string> {
     const normalizedUrl = this.normalizeUrl(dbUrl, dbType);
-    const dbKey = `${dbType}:${normalizedUrl}`;
+    const dbKey = this.hashDbKey(dbType, normalizedUrl);
 
     const existing = await SchemaRegistryModel.findOne({ dbKey });
     if (existing && !forceRefresh && !this.isStale(existing)) {
@@ -88,6 +90,12 @@ export class SchemaRegistryService {
     const qIndex = stripped.indexOf('?');
     if (qIndex >= 0) stripped = stripped.substring(0, qIndex);
     return stripped;
+  }
+
+  private hashDbKey(dbType: DBType, normalizedUrl: string): string {
+    const h = crypto.createHash('sha256');
+    h.update(`${dbType}:${normalizedUrl}`);
+    return h.digest('hex');
   }
 }
 
