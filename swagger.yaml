@@ -1,3 +1,8 @@
+swagger: "2.0"
+info:
+  title: AI Agent API with WebSocket Chat
+  version: "1.0.0"
+  description: Advanced AI Agent API with WebSocket-based chat service
 tags:
 - name: users
   description: users API
@@ -244,11 +249,19 @@ definitions:
       dbUrl:
         type: string
         description: Database connection string (MongoDB/PostgreSQL/MySQL)
-        example: "postgresql://user:pass@localhost:5432/mydb"
+        example: "postgres://user:pass@localhost:5432/mydb"
       dbType:
         type: string
         enum: [mongodb, postgres, mysql]
         description: Optional hint for database type, auto-detected from dbUrl if omitted
+      dryRun:
+        type: boolean
+        description: If true, plan and queries are generated but not executed
+        example: false
+      refreshSchema:
+        type: boolean
+        description: Force refresh of cached schema for this database
+        example: false
 
   aiFeedback:
     type: object
@@ -262,75 +275,7 @@ definitions:
         type: string
         enum: [positive, negative]
 
-schemes:
- - https
- - http
-
-# Socket.IO documentation (custom extension)
-x-socketio:
-  url: ws(s)://<host>
-  auth:
-    description: |
-      Use Socket.IO auth with a JWT token.
-      Example (client): io('http://localhost:3000', { auth: { token: 'Bearer <JWT>' } })
-      Or send Authorization header: 'Authorization: Bearer <JWT>'
-  events:
-    client_to_server:
-      - name: join-session
-        summary: Join a chat session
-        payload:
-          $ref: '#/definitions/wsJoinSession'
-      - name: send-message
-        summary: Send a message (optionally include dbUrl/dbType to route to multi-DB AI agent)
-        payload:
-          $ref: '#/definitions/wsSendMessage'
-      - name: typing
-        summary: Typing indicator
-        payload:
-          $ref: '#/definitions/wsTyping'
-      - name: get-sessions
-        summary: List active sessions for the user
-        payload:
-          $ref: '#/definitions/wsGetSessions'
-      - name: create-session
-        summary: Create a new chat session
-        payload:
-          $ref: '#/definitions/wsCreateSession'
-      - name: delete-session
-        summary: Soft-delete a chat session
-        payload:
-          $ref: '#/definitions/wsDeleteSession'
-    server_to_client:
-      - name: session-joined
-        payload:
-          $ref: '#/definitions/wsSessionJoined'
-      - name: message-received
-        payload:
-          $ref: '#/definitions/wsMessageReceived'
-      - name: agent-thinking
-        payload:
-          $ref: '#/definitions/wsAgentThinking'
-      - name: agent-response
-        payload:
-          $ref: '#/definitions/wsAgentResponse'
-      - name: typing-indicator
-        payload:
-          $ref: '#/definitions/wsTypingIndicator'
-      - name: sessions-list
-        payload:
-          $ref: '#/definitions/wsSessionsList'
-      - name: session-created
-        payload:
-          $ref: '#/definitions/wsSessionCreated'
-      - name: session-deleted
-        payload:
-          $ref: '#/definitions/wsSessionDeleted'
-      - name: error
-        payload:
-          $ref: '#/definitions/wsError'
-
-# WebSocket (Socket.IO) schemas
-definitions:
+  # WebSocket (Socket.IO) schemas moved here for single definitions block
   ChatMessage:
     type: object
     properties:
@@ -555,3 +500,71 @@ definitions:
         type: string
       code:
         type: string
+
+schemes:
+ - https
+ - http
+
+# Socket.IO documentation (custom extension)
+x-socketio:
+  url: ws(s)://<host>
+  auth:
+    description: |
+      Use Socket.IO auth with a JWT token.
+      Example (client): io('http://localhost:3000', { auth: { token: 'Bearer <JWT>' } })
+      Or send Authorization header: 'Authorization: Bearer <JWT>'
+  events:
+    client_to_server:
+      - name: join-session
+        summary: Join a chat session
+        payload:
+          $ref: '#/definitions/wsJoinSession'
+      - name: send-message
+        summary: Send a message (optionally include dbUrl/dbType to route to multi-DB AI agent)
+        payload:
+          $ref: '#/definitions/wsSendMessage'
+      - name: typing
+        summary: Typing indicator
+        payload:
+          $ref: '#/definitions/wsTyping'
+      - name: get-sessions
+        summary: List active sessions for the user
+        payload:
+          $ref: '#/definitions/wsGetSessions'
+      - name: create-session
+        summary: Create a new chat session
+        payload:
+          $ref: '#/definitions/wsCreateSession'
+      - name: delete-session
+        summary: Soft-delete a chat session
+        payload:
+          $ref: '#/definitions/wsDeleteSession'
+    server_to_client:
+      - name: session-joined
+        payload:
+          $ref: '#/definitions/wsSessionJoined'
+      - name: message-received
+        payload:
+          $ref: '#/definitions/wsMessageReceived'
+      - name: agent-thinking
+        payload:
+          $ref: '#/definitions/wsAgentThinking'
+      - name: agent-response
+        payload:
+          $ref: '#/definitions/wsAgentResponse'
+      - name: typing-indicator
+        payload:
+          $ref: '#/definitions/wsTypingIndicator'
+      - name: sessions-list
+        payload:
+          $ref: '#/definitions/wsSessionsList'
+      - name: session-created
+        payload:
+          $ref: '#/definitions/wsSessionCreated'
+      - name: session-deleted
+        payload:
+          $ref: '#/definitions/wsSessionDeleted'
+      - name: error
+        payload:
+          $ref: '#/definitions/wsError'
+

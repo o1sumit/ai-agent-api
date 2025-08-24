@@ -6,6 +6,7 @@ export interface AIQueryRequest {
   dbType?: DBType;
   dryRun?: boolean;
   refreshSchema?: boolean;
+  insight?: boolean;
 }
 
 export interface AIQueryResponse {
@@ -15,6 +16,7 @@ export interface AIQueryResponse {
   suggestions?: string[];
   executionTime?: number;
   memoryInsights?: MemoryInsights;
+  success?: boolean;
 }
 
 export interface SampleQueriesResponse {

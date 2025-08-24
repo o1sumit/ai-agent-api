@@ -26,9 +26,9 @@ export class DbPoolService {
             case 'mongodb':
                 return { type, mongo: await this.getMongoConnection(dbUrl) };
             case 'postgres':
-                return { type, pg: this.getPgPool(dbUrl) };
+                return { type, pg: await this.getPgPoolWithTest(dbUrl) };
             case 'mysql':
-                return { type, mysql: this.getMysqlPool(dbUrl) };
+                return { type, mysql: await this.getMysqlPoolWithTest(dbUrl) };
             default:
                 throw new Error(`Unsupported database type: ${type as string}`);
         }
@@ -59,24 +59,44 @@ export class DbPoolService {
             return conn;
         } catch (e: any) {
             logger.error(`MongoDB connection failed: ${e.message}`);
-            throw e;
+            throw new Error(`DB_CONNECTION_FAILED: ${e.message}`);
         }
     }
 
-    private getPgPool(dbUrl: string): PgPool {
+    private async getPgPoolWithTest(dbUrl: string): Promise<PgPool> {
         const existing = this.pgPools.get(dbUrl);
         if (existing) return existing;
 
         const pool = new PgPool({ connectionString: dbUrl, max: PG_POOL_MAX, statement_timeout: QUERY_TIMEOUT_MS });
+        try {
+            await Promise.race([
+                pool.query('SELECT 1'),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout connecting to Postgres')), 5000)),
+            ]);
+        } catch (e: any) {
+            logger.error(`Postgres connection test failed: ${e.message}`);
+            try { await pool.end(); } catch {}
+            throw new Error(`DB_CONNECTION_FAILED: ${e.message}`);
+        }
         this.pgPools.set(dbUrl, pool);
         return pool;
     }
 
-    private getMysqlPool(dbUrl: string): MysqlPool {
+    private async getMysqlPoolWithTest(dbUrl: string): Promise<MysqlPool> {
         const existing = this.mysqlPools.get(dbUrl);
         if (existing) return existing;
 
         const pool = createMysqlPool(dbUrl);
+        try {
+            await Promise.race([
+                pool.query('SELECT 1'),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout connecting to MySQL')), 5000)),
+            ]);
+        } catch (e: any) {
+            logger.error(`MySQL connection test failed: ${e.message}`);
+            try { await (pool as any).end?.(); } catch {}
+            throw new Error(`DB_CONNECTION_FAILED: ${e.message}`);
+        }
         this.mysqlPools.set(dbUrl, pool);
         return pool;
     }

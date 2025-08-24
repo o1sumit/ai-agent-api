@@ -109,6 +109,8 @@
           </div>
           <div class="col-12 actions">
             <label style="display:flex;align-items:center;gap:8px;color:#9ca3af;font-size:12px"><input type="checkbox" id="dryRun" /> Dry run (preview only)</label>
+            <label style="display:flex;align-items:center;gap:8px;color:#9ca3af;font-size:12px"><input type="checkbox" id="refreshSchema" /> Refresh schema</label>
+            <label style="display:flex;align-items:center;gap:8px;color:#9ca3af;font-size:12px"><input type="checkbox" id="insight" checked /> Insight (verbose response)</label>
             <button id="btnLogin" class="secondary">Login</button>
             <button id="btnAuto" class="secondary">Auto Fill IDs</button>
             <button id="btnJoin">Join Session</button>
@@ -117,6 +119,25 @@
             <button id="btnGetSessions" class="secondary">Get Sessions</button>
             <button id="btnCreateSession" class="secondary">Create Session</button>
             <button id="btnDeleteSession" class="secondary">Delete Session</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div class="col-12">
+            <div class="card-header"><h3>HTTP AI Agent Request</h3><div class="actions"><button id="btnHttpSend">Send HTTP</button><button id="btnCopyReq" class="secondary">Copy</button></div></div>
+            <textarea id="httpBody" class="code" style="min-height:140px;">{
+  "query": "Top 5 products by revenue last 30 days",
+  "dbUrl": "postgres://user:pass@localhost:5432/mydb",
+  "dbType": "postgres",
+  "dryRun": false,
+  "refreshSchema": false,
+  "insight": true
+}</textarea>
+            <div class="divider"></div>
+            <div class="card-header"><h3>HTTP Response</h3><div class="actions"><button id="btnClearHttp" class="secondary">Clear</button></div></div>
+            <pre id="httpResp" class="code"></pre>
           </div>
         </div>
       </div>

@@ -155,12 +155,25 @@ export class WebSocketChatService {
           // Get conversation history
           const conversationHistory = await ChatMessageModel.find({ sessionId }).sort({ createdAt: -1 }).limit(20).lean();
 
+          // Determine effective DB context
+          let effectiveDbUrl = dbUrl;
+          let effectiveDbType = dbType as any;
+          try {
+            if (!effectiveDbUrl && session?.context?.databaseContext && session.context.databaseContext.length > 0) {
+              const stored = JSON.parse(String(session.context.databaseContext[0]));
+              if (stored?.dbUrl) effectiveDbUrl = stored.dbUrl;
+              if (stored?.dbType) effectiveDbType = stored.dbType;
+            }
+          } catch (_) {
+            // ignore parse errors
+          }
+
           // Process message
           let agentResponse;
-          if (dbUrl) {
-            // If DB URL provided in chat, route to the new AI Agent multi-DB flow directly
+          if (effectiveDbUrl) {
+            // Route to AI Agent multi-DB flow using session-bound context
             const aiAgent = new (require('./ai-agent.service').AIAgentService)();
-            const result = await aiAgent.processQuery(message, userId, { dbUrl, dbType: dbType as any, dryRun });
+            const result = await aiAgent.processQuery(message, userId, { dbUrl: effectiveDbUrl, dbType: effectiveDbType, dryRun });
             agentResponse = {
               message: result.message || (typeof result?.data === 'object' ? JSON.stringify(result.data) : String(result?.data ?? '')),
               type: dryRun ? 'text' : 'data',
@@ -172,9 +185,19 @@ export class WebSocketChatService {
               trace: result.trace,
               executedQueries: result.executedQueries,
             } as any;
+
+            // Persist db context for future messages in this session
+            try {
+              if (!session.context) session.context = {} as any;
+              const packed = JSON.stringify({ dbUrl: effectiveDbUrl, dbType: effectiveDbType });
+              session.context.databaseContext = [packed];
+            } catch (_) {
+              // ignore
+            }
           } else {
-            // Fallback to the existing database agent workflow
-            agentResponse = await this.databaseAgent.processMessage(message, userId, sessionId, conversationHistory.reverse());
+            // Fallback to LangGraph-based workflow with enriched context
+            const enrichedHistory = conversationHistory.reverse();
+            agentResponse = await this.databaseAgent.processMessage(message, userId, sessionId, enrichedHistory);
           }
 
           // Create agent message

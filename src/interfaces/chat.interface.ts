@@ -56,14 +56,19 @@ export interface DatabaseTool {
 }
 
 export interface AgentState {
-  messages: ChatMessage[];
+  messages: any[];
   currentQuery?: string;
   context: {
     userId: string;
     sessionId: string;
+    dbUrl?: string;
+    dbType?: 'mongodb' | 'postgres' | 'mysql';
     databaseSchema?: any;
     userMemory?: any;
     conversationHistory?: ChatMessage[];
+    queryAnalysis?: string;
+    executionPlan?: string;
+    toolResults?: any[];
   };
   tools: DatabaseTool[];
   thinking?: string;

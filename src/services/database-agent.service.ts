@@ -1,4 +1,4 @@
-import { GOOGLE_API_KEY } from '@config';
+import { GOOGLE_API_KEY, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS } from '@config';
 import { AgentResponse, AgentState, DatabaseTool } from '@interfaces/chat.interface';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { DynamicTool } from '@langchain/core/tools';
@@ -9,30 +9,33 @@ import { logger } from '@utils/logger';
 import mongoose from 'mongoose';
 import { Service } from 'typedi';
 import { AIMemoryService } from './ai-memory.service';
+import { SchemaRegistryService } from './schema-registry.service';
 import { SchemaDetectorService } from './schema-detector.service';
 
 @Service()
 export class DatabaseAgentService {
   private llm: ChatGoogleGenerativeAI;
   private schemaDetector: SchemaDetectorService;
+  private schemaRegistry: SchemaRegistryService;
   private memoryService: AIMemoryService;
-  private graph: StateGraph<AgentState>;
+  private graph: any;
 
   constructor() {
     this.llm = new ChatGoogleGenerativeAI({
       apiKey: GOOGLE_API_KEY,
       model: 'gemini-1.5-flash',
-      temperature: 0.2,
+      temperature: 0.1,
     });
 
     this.schemaDetector = new SchemaDetectorService();
+    this.schemaRegistry = new SchemaRegistryService();
     this.memoryService = new AIMemoryService();
     this.initializeAgent();
   }
 
   private initializeAgent() {
     // Create the state graph for the agent workflow
-    this.graph = new StateGraph<AgentState>({
+    const g: any = new StateGraph<AgentState>({
       channels: {
         messages: { reducer: (x, y) => x.concat(y) },
         currentQuery: { reducer: (x, y) => y ?? x },
@@ -44,21 +47,21 @@ export class DatabaseAgentService {
     });
 
     // Define the agent workflow nodes
-    this.graph.addNode('analyze_query', this.analyzeQuery.bind(this));
-    this.graph.addNode('load_context', this.loadContext.bind(this));
-    this.graph.addNode('plan_execution', this.planExecution.bind(this));
-    this.graph.addNode('execute_tools', this.executeTools.bind(this));
-    this.graph.addNode('generate_response', this.generateResponse.bind(this));
+    g.addNode('analyze_query', this.analyzeQuery.bind(this));
+    g.addNode('load_context', this.loadContext.bind(this));
+    g.addNode('plan_execution', this.planExecution.bind(this));
+    g.addNode('execute_tools', this.executeTools.bind(this));
+    g.addNode('generate_response', this.generateResponse.bind(this));
 
     // Define the workflow edges
-    this.graph.addEdge(START, 'analyze_query');
-    this.graph.addEdge('analyze_query', 'load_context');
-    this.graph.addEdge('load_context', 'plan_execution');
-    this.graph.addEdge('plan_execution', 'execute_tools');
-    this.graph.addEdge('execute_tools', 'generate_response');
-    this.graph.addEdge('generate_response', END);
+    g.addEdge(START, 'analyze_query');
+    g.addEdge('analyze_query', 'load_context');
+    g.addEdge('load_context', 'plan_execution');
+    g.addEdge('plan_execution', 'execute_tools');
+    g.addEdge('execute_tools', 'generate_response');
+    g.addEdge('generate_response', END);
 
-    this.graph = this.graph.compile();
+    this.graph = g.compile();
   }
 
   public async processMessage(message: string, userId: string, _sessionId: string, conversationHistory: any[] = []): Promise<AgentResponse> {
@@ -146,7 +149,7 @@ Do not include any raw data or technical details.`;
   private async analyzeQuery(state: AgentState): Promise<Partial<AgentState>> {
     const query = state.currentQuery || '';
     const thinking = `Analyzing user query: "${query}"`;
-
+    const started = Date.now();
     logger.info(`Agent thinking: ${thinking}`);
 
     // Determine query intent and complexity
@@ -161,6 +164,7 @@ Query: "${query}"`),
       new HumanMessage('Return a short analysis.'),
     ]);
 
+    logger.info(`analyze_query completed in ${Date.now() - started}ms`);
     return {
       thinking,
       context: {
@@ -173,14 +177,23 @@ Query: "${query}"`),
   private async loadContext(state: AgentState): Promise<Partial<AgentState>> {
     const { userId } = state.context;
     const thinking = 'Loading database schema and user context...';
+    const started = Date.now();
 
-    // Load database schema
-    const schemas = await this.schemaDetector.getAllSchemas();
-    const schemaInfo = this.schemaDetector.getSchemaAsString(schemas);
+    // Load database schema (reuse persistent registry when possible)
+    let schemaInfo = '';
+    try {
+      // Fallback: use default mongoose connection schema when no external dbUrl here
+      const schemas = await this.schemaDetector.getAllSchemas();
+      schemaInfo = this.schemaDetector.getSchemaAsString(schemas);
+    } catch (e: any) {
+      logger.warn(`Schema load failed in loadContext: ${e.message}`);
+      schemaInfo = '[]';
+    }
 
     // Load user memory
     const memoryInsights = await this.memoryService.getMemoryInsights(userId, state.currentQuery || '');
 
+    logger.info(`load_context completed in ${Date.now() - started}ms`);
     return {
       thinking,
       context: {
@@ -193,6 +206,7 @@ Query: "${query}"`),
 
   private async planExecution(state: AgentState): Promise<Partial<AgentState>> {
     const thinking = 'Planning the best approach to answer your question...';
+    const started = Date.now();
 
     const planningPrompt = `Based on the user query and available context, create an execution plan.
 
@@ -210,6 +224,7 @@ Create a step-by-step plan to answer the user's query effectively.`;
       new HumanMessage('Return only the plan text.'),
     ]);
 
+    logger.info(`plan_execution completed in ${Date.now() - started}ms`);
     return {
       thinking,
       context: {
@@ -222,25 +237,34 @@ Create a step-by-step plan to answer the user's query effectively.`;
   private async executeTools(state: AgentState): Promise<Partial<AgentState>> {
     const thinking = 'Executing database operations...';
     const toolResults: any[] = [];
+    const started = Date.now();
 
     try {
       // Create dynamic tools for this execution
       const tools = await this.createDynamicTools();
 
       // Use the LLM to decide which tools to use and how
-      const toolSelectionPrompt = `Based on the execution plan and user query, determine which database operations to perform.
+      const toolSelectionPrompt = `You are an execution planner. Choose database tools to run.
 
-Query: "${state.currentQuery}"
+User Query: "${state.currentQuery}"
 Plan: ${state.context.executionPlan}
 
 Available Tools:
 ${tools.map(tool => `${tool.name}: ${tool.description}`).join('\n')}
 
-Execute the necessary database operations to answer the user's query.`;
+Strictly output a JSON array of objects with this schema (no prose):
+[
+  { "name": "query_users" | "count_documents" | "aggregate_data", "input": { ...toolSpecificParams } }
+]
+
+Rules:
+- Only include tools you truly need.
+- Validate that required params are present.
+- For reads, include reasonable limits.`;
 
       const toolDecision = await this.llm.invoke([
         new SystemMessage(toolSelectionPrompt),
-        new HumanMessage('Return tool calls in a machine-readable way.'),
+        new HumanMessage('Return ONLY the JSON array of tool calls.'),
       ]);
 
       // Parse and execute tools based on the decision
@@ -250,7 +274,7 @@ Execute the necessary database operations to answer the user's query.`;
         const tool = tools.find(t => t.name === toolExec.name);
         if (tool) {
           try {
-            const result = await tool.call(toolExec.input);
+            const result = await tool.call(JSON.stringify(toolExec.input));
             toolResults.push({
               tool: toolExec.name,
               input: toolExec.input,
@@ -270,6 +294,7 @@ Execute the necessary database operations to answer the user's query.`;
       logger.error(`Tool execution planning error: ${error.message}`);
     }
 
+    logger.info(`execute_tools completed in ${Date.now() - started}ms`);
     return {
       thinking,
       context: {
@@ -281,6 +306,7 @@ Execute the necessary database operations to answer the user's query.`;
 
   private async generateResponse(state: AgentState): Promise<Partial<AgentState>> {
     const thinking = 'Generating final response...';
+    const started = Date.now();
 
     const responsePrompt = `Generate a helpful response based on the database query results.
 
@@ -310,6 +336,7 @@ Response format should be conversational and user-friendly.`;
       followUpQuestions: this.generateFollowUpQuestions(state.currentQuery || '', state.context.toolResults || []),
     };
 
+    logger.info(`generate_response completed in ${Date.now() - started}ms`);
     return {
       thinking,
       finalResponse,
@@ -365,10 +392,20 @@ Response format should be conversational and user-friendly.`;
         description: 'Query user data from the database',
         func: async (input: string) => {
           try {
-            const params = JSON.parse(input);
-            const result = await UserModel.find(params.filter || {}, { password: 0 })
-              .limit(params.limit || 10)
-              .sort(params.sort || {});
+            const params = JSON.parse(input || '{}');
+            const filter = params.filter || {};
+            // Guardrails: block dangerous operators
+            const containsDangerous = (obj: any): boolean => {
+              if (!obj || typeof obj !== 'object') return false;
+              if (Array.isArray(obj)) return obj.some(containsDangerous);
+              return Object.keys(obj).some(k => k === '$where' || k === '$function' || (typeof obj[k] === 'object' && containsDangerous(obj[k])));
+            };
+            if (containsDangerous(filter)) throw new Error('Dangerous Mongo operator in filter');
+
+            const limit = Math.min(Number(params.limit) || 10, DEFAULT_ROW_LIMIT);
+            const sort = params.sort || {};
+            const projection = { password: 0 };
+            const result = await UserModel.find(filter, projection).limit(limit).sort(sort).maxTimeMS(QUERY_TIMEOUT_MS);
             return JSON.stringify(result);
           } catch (error) {
             return `Error: ${error.message}`;
@@ -380,9 +417,10 @@ Response format should be conversational and user-friendly.`;
         description: 'Count documents in a collection',
         func: async (input: string) => {
           try {
-            const params = JSON.parse(input);
+            const params = JSON.parse(input || '{}');
+            if (!params.collection) throw new Error('collection is required');
             const model = this.getModelForCollection(params.collection);
-            const count = await model.countDocuments(params.filter || {});
+            const count = await model.countDocuments(params.filter || {}).maxTimeMS(QUERY_TIMEOUT_MS);
             return count.toString();
           } catch (error) {
             return `Error: ${error.message}`;
@@ -394,9 +432,13 @@ Response format should be conversational and user-friendly.`;
         description: 'Perform aggregation operations on data',
         func: async (input: string) => {
           try {
-            const params = JSON.parse(input);
+            const params = JSON.parse(input || '{}');
+            if (!params.collection || !Array.isArray(params.pipeline)) throw new Error('collection and pipeline are required');
             const model = this.getModelForCollection(params.collection);
-            const result = await model.aggregate(params.pipeline);
+            const pipeline = [...params.pipeline];
+            if (pipeline.some((st: any) => st.$out || st.$merge)) throw new Error('Dangerous aggregation stage blocked');
+            if (!pipeline.some((st: any) => st.$limit)) pipeline.push({ $limit: DEFAULT_ROW_LIMIT });
+            const result = await model.aggregate(pipeline).option({ maxTimeMS: QUERY_TIMEOUT_MS });
             return JSON.stringify(result);
           } catch (error) {
             return `Error: ${error.message}`;
@@ -419,17 +461,34 @@ Response format should be conversational and user-friendly.`;
   }
 
   private parseToolExecution(toolDecision: string): Array<{ name: string; input: any }> {
-    // Simple parsing logic - in production, you might want more sophisticated parsing
-    const tools: Array<{ name: string; input: any }> = [];
-
-    if (toolDecision.includes('query_users')) {
-      tools.push({
-        name: 'query_users',
-        input: '{"filter": {}, "limit": 10}',
-      });
+    try {
+      const allowed = new Set(['query_users', 'count_documents', 'aggregate_data']);
+      const parsed = JSON.parse(this.sanitizeJsonContent(toolDecision));
+      if (!Array.isArray(parsed)) return [];
+      const cleaned: Array<{ name: string; input: any }> = [];
+      for (const item of parsed) {
+        const name = String(item?.name || '');
+        const input = item?.input ?? {};
+        if (!allowed.has(name)) continue;
+        // lightweight validation
+        if (name === 'query_users') {
+          if (input.limit != null) input.limit = Math.min(Number(input.limit) || 10, DEFAULT_ROW_LIMIT);
+          else input.limit = Math.min(10, DEFAULT_ROW_LIMIT);
+        }
+        if (name !== 'query_users' && !input.collection) continue;
+        cleaned.push({ name, input });
+      }
+      return cleaned;
+    } catch {
+      return [];
     }
+  }
 
-    return tools;
+  private sanitizeJsonContent(text: string): string {
+    return (text || '')
+      .replace(/```json[\s\S]*?```/g, (m) => m.replace(/```json|```/g, ''))
+      .replace(/\bTrue\b/g, 'true')
+      .replace(/\bFalse\b/g, 'false');
   }
 
   private calculateConfidence(toolResults: any[]): number {

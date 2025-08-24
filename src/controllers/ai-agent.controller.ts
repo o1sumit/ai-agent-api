@@ -9,7 +9,7 @@ export class AIAgentController {
 
   public processQuery = async (req: RequestWithUser, res: Response, next: NextFunction) => {
     try {
-      const { query, dbUrl, dbType, refreshSchema }: AIQueryRequest = req.body;
+      const { query, dbUrl, dbType, refreshSchema, insight }: AIQueryRequest = req.body;
       const userId = req.user?._id || 'anonymous';
 
       if (!query || typeof query !== 'string' || query.trim().length === 0) {
@@ -24,9 +24,18 @@ export class AIAgentController {
         });
       }
 
-      const result = await this.aiAgent.processQuery(query.trim(), userId.toString(), { dbUrl: dbUrl.trim(), dbType, refreshSchema });
+      const result = await this.aiAgent.processQuery(query.trim(), userId.toString(), { dbUrl: dbUrl.trim(), dbType, refreshSchema, insight });
 
-      res.status(200).json(result);
+      if (insight === true) {
+        return res.status(200).json(result);
+      }
+
+      // Minimal response when insight is false/omitted
+      return res.status(200).json({
+        data: result.data,
+        message: result.message,
+        success: true,
+      });
     } catch (error) {
       next(error);
     }

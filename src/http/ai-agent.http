@@ -1,13 +1,13 @@
 ### Enhanced AI Agent API Endpoints
 
 ### Get AI Agent Status (Public)
-GET http://localhost:3000/ai-agent/status
+GET http://localhost:3000/api/ai-agent/status
 Content-Type: application/json
 
 ###
 
 ### Get Sample Queries (Public)
-GET http://localhost:3000/ai-agent/samples
+GET http://localhost:3000/api/ai-agent/samples
 Content-Type: application/json
 
 ###
@@ -24,62 +24,102 @@ Content-Type: application/json
 ###
 
 ### Process Natural Language Query (Requires Authentication)
-POST http://localhost:3000/ai-agent/query
+POST http://localhost:3000/api/ai-agent/query
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
 {
-  "query": "Get all users"
+  "query": "Get all users",
+  "dbUrl": "mongodb://localhost:27017/ai_agent",
+  "dbType": "mongodb",
+  "dryRun": false,
+  "refreshSchema": false
 }
 
 ###
 
 ### Process Query - Find User by Email (Requires Authentication)
-POST http://localhost:3000/ai-agent/query
+POST http://localhost:3000/api/ai-agent/query
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
 {
-  "query": "Find user with email john@example.com"
+  "query": "Find user with email john@example.com",
+  "dbUrl": "mongodb://localhost:27017/ai_agent",
+  "dbType": "mongodb"
 }
 
 ###
 
 ### Process Query - Count Users (Requires Authentication)
-POST http://localhost:3000/ai-agent/query
+POST http://localhost:3000/api/ai-agent/query
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
 {
-  "query": "How many users are registered?"
+  "query": "How many users are registered?",
+  "dbUrl": "mongodb://localhost:27017/ai_agent",
+  "dbType": "mongodb"
 }
 
 ###
 
 ### Process Query - Recent Users (Requires Authentication)
-POST http://localhost:3000/ai-agent/query
+POST http://localhost:3000/api/ai-agent/query
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
 {
-  "query": "Show me users created in the last 7 days"
+  "query": "Show me users created in the last 7 days",
+  "dbUrl": "mongodb://localhost:27017/ai_agent",
+  "dbType": "mongodb"
 }
 
 ###
 
 ### Process Query - Gmail Users (Requires Authentication)
-POST http://localhost:3000/ai-agent/query
+POST http://localhost:3000/api/ai-agent/query
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
 {
-  "query": "Find all users with Gmail email addresses"
+  "query": "Find all users with Gmail email addresses",
+  "dbUrl": "mongodb://localhost:27017/ai_agent",
+  "dbType": "mongodb"
+}
+
+###
+
+### Process Query - Dry Run Preview (no execution)
+POST http://localhost:3000/api/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "Show top 5 products by revenue in last 30 days",
+  "dbUrl": "postgres://user:pass@localhost:5432/mydb",
+  "dbType": "postgres",
+  "dryRun": true
+}
+
+###
+
+### Process Query - Force Schema Refresh
+POST http://localhost:3000/api/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "List tables and columns",
+  "dbUrl": "mysql://user:pass@localhost:3306/mydb",
+  "dbType": "mysql",
+  "refreshSchema": true
 }
 
 ###
 
 ### Record Positive Feedback (Requires Authentication)
-POST http://localhost:3000/ai-agent/feedback
+POST http://localhost:3000/api/ai-agent/feedback
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
@@ -91,7 +131,7 @@ Authorization: Bearer YOUR_JWT_TOKEN_HERE
 ###
 
 ### Record Negative Feedback (Requires Authentication)
-POST http://localhost:3000/ai-agent/feedback
+POST http://localhost:3000/api/ai-agent/feedback
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
@@ -103,13 +143,53 @@ Authorization: Bearer YOUR_JWT_TOKEN_HERE
 ###
 
 ### Get User Statistics (Requires Authentication)
-GET http://localhost:3000/ai-agent/stats
+GET http://localhost:3000/api/ai-agent/stats
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE
 
 ###
 
 ### Refresh Schema Cache (Requires Authentication)
-POST http://localhost:3000/ai-agent/refresh-schema
+POST http://localhost:3000/api/ai-agent/refresh-schema
+
+###
+
+### Process Query - Postgres Example (Requires Authentication)
+POST http://localhost:3000/api/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+###
+
+### Status and Samples (Public)
+GET http://localhost:3000/api/ai-agent/status
+Content-Type: application/json
+
+###
+
+GET http://localhost:3000/api/ai-agent/samples
+Content-Type: application/json
+
+{
+  "query": "Top 5 products by revenue last 30 days",
+  "dbUrl": "postgres://user:pass@localhost:5432/mydb",
+  "dbType": "postgres",
+  "dryRun": false,
+  "refreshSchema": false
+}
+
+###
+
+### Process Query - MySQL Example (Requires Authentication)
+POST http://localhost:3000/api/ai-agent/query
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN_HERE
+
+{
+  "query": "Recent orders in the last week",
+  "dbUrl": "mysql://user:pass@localhost:3306/mydb",
+  "dbType": "mysql",
+  "dryRun": true
+}
 Content-Type: application/json
 Authorization: Bearer YOUR_JWT_TOKEN_HERE

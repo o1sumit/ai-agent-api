@@ -132,6 +132,8 @@
     if (dbType) payload.dbType = dbType;
     const dryRunEl = document.getElementById('dryRun');
     if (dryRunEl && dryRunEl.checked) payload.dryRun = true;
+    const refreshEl = document.getElementById('refreshSchema');
+    if (refreshEl && refreshEl.checked) payload.refreshSchema = true;
     socket.emit('send-message', payload);
     ev(`send-message: ${JSON.stringify(payload)}`);
   };
@@ -177,6 +179,39 @@
   // Add clear plan button handler if present
   const clrP = document.getElementById('btnClearPlan');
   if (clrP) clrP.onclick = () => { const el = document.getElementById('planLog'); if (el) el.innerHTML = ''; };
+
+  // HTTP client helpers
+  const pretty = (obj) => syntaxHighlight(typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2));
+  const httpSend = async () => {
+    const host = $('#host').value.trim() || 'http://localhost:3000';
+    const token = $('#token').value.trim();
+    const bodyText = $('#httpBody').value;
+    try {
+      const res = await fetch(`${host}/api/ai-agent/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: bodyText,
+      });
+      const data = await res.json().catch(() => ({}));
+      const out = document.getElementById('httpResp');
+      out.innerHTML += `${new Date().toLocaleTimeString()}\n${pretty(data)}\n\n`;
+      out.scrollTop = out.scrollHeight;
+    } catch (e) {
+      const out = document.getElementById('httpResp');
+      out.innerHTML += `${new Date().toLocaleTimeString()}\n${pretty({ error: e.message })}\n\n`;
+      out.scrollTop = out.scrollHeight;
+    }
+  };
+  const copyReq = async () => {
+    try { await navigator.clipboard.writeText($('#httpBody').value); ev('HTTP body copied'); } catch { ev('copy failed'); }
+  };
+
+  const btnHttp = document.getElementById('btnHttpSend');
+  if (btnHttp) btnHttp.addEventListener('click', httpSend);
+  const btnCopyReq = document.getElementById('btnCopyReq');
+  if (btnCopyReq) btnCopyReq.addEventListener('click', copyReq);
+  const btnClearHttp = document.getElementById('btnClearHttp');
+  if (btnClearHttp) btnClearHttp.addEventListener('click', () => { const el = document.getElementById('httpResp'); if (el) el.innerHTML = ''; });
 })();
 
 

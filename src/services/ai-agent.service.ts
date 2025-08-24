@@ -2,7 +2,7 @@ import { Service } from 'typedi';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { GOOGLE_API_KEY, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS, REDACT_SQL_IN_RESPONSES } from '@config';
-import { HttpException } from '@exceptions/httpException';
+import { HttpException } from '@exceptions/HttpException';
 import { SchemaDetectorService } from './schema-detector.service';
 import { SQLSchemaDetectorService } from './sql-schema-detector.service';
 import { DbPoolService } from './db-pool.service';
@@ -11,6 +11,9 @@ import { QueryResult, MongoQueryObject, SQLQueryObject, DBType } from '@interfac
 import { logger } from '@utils/logger';
 import mongoose from 'mongoose';
 import { SchemaRegistryService } from './schema-registry.service';
+import { SqlInsightService } from './sql-insight.service';
+import { DataProfilerService } from './data-profiler.service';
+import { SchemaKeywordMatcherService } from './schema-keyword-matcher.service';
 
 type PlanStep =
   | {
@@ -39,6 +42,7 @@ interface DBConnectionOptions {
   dbUrl: string;
   dbType?: DBType;
   refreshSchema?: boolean;
+  insight?: boolean;
 }
 
 @Service()
@@ -49,6 +53,9 @@ export class AIAgentService {
   private dbPool: DbPoolService;
   private memoryService: AIMemoryService;
   private schemaRegistry: SchemaRegistryService;
+  private sqlInsight: SqlInsightService;
+  private profiler: DataProfilerService;
+  private schemaMatcher: SchemaKeywordMatcherService;
 
   constructor() {
     if (!GOOGLE_API_KEY) {
@@ -66,6 +73,9 @@ export class AIAgentService {
     this.dbPool = new DbPoolService();
     this.memoryService = new AIMemoryService();
     this.schemaRegistry = new SchemaRegistryService();
+    this.sqlInsight = new SqlInsightService();
+    this.profiler = new DataProfilerService();
+    this.schemaMatcher = new SchemaKeywordMatcherService();
   }
 
   public async processQuery(userQuery: string, userId: string, dbOptions: DBConnectionOptions & { dryRun?: boolean }): Promise<QueryResult> {
@@ -122,6 +132,22 @@ export class AIAgentService {
         dbOptions.refreshSchema === true,
       );
 
+      // Build quick capability summary to guide planning
+      let capabilitySummary = '';
+      try {
+        capabilitySummary = await this.profiler.getCapabilitiesSummary(dbConnection);
+      } catch (e: any) {
+        logger.warn(`Profiling failed: ${e.message}`);
+      }
+
+      // Lightweight keyword-to-schema candidates (primarily for Mongo collections)
+      let schemaHints: any = null;
+      try {
+        schemaHints = await this.schemaMatcher.match(userQuery, dbConnection);
+      } catch (e: any) {
+        logger.warn(`Schema keyword match failed: ${e.message}`);
+      }
+
       // Plan → Execute workflow
       let plan: ExecutionPlan | null = null;
       let finalData: any = null;
@@ -129,7 +155,9 @@ export class AIAgentService {
       let toolOutputs: Array<{ stepIndex: number; type: string; output: any }> = [];
 
       try {
-        plan = await this.planExecution(userQuery, schemaInfo, memoryInsights, dbConnection.type);
+        // Enrich plan prompt with capability summary
+        const enrichedMemory = { ...memoryInsights, capabilitySummary, schemaHints } as any;
+        plan = await this.planExecution(userQuery, schemaInfo, enrichedMemory, dbConnection.type);
         if (dbOptions.dryRun) {
           // Only preview: synthesize executedQueries list by generating queries without executing
           for (let i = 0; i < plan.steps.length; i++) {
@@ -141,7 +169,25 @@ export class AIAgentService {
             }
           }
         } else {
-          const execution = await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery);
+          // Heuristic: if the user asks for top/most selling product and DB is SQL, attempt an insight-first query
+          if (dbConnection.type !== 'mongodb' && /most\s+selling|top\s+selling|best\s+selling/i.test(userQuery)) {
+            try {
+              const sql = await this.sqlInsight.getTopSellingSQL(dbConnection.type, dbConnection.type === 'postgres' ? dbConnection.pg : dbConnection.mysql);
+              if (sql) {
+                const quickQuery: SQLQueryObject = { operation: 'sql', queryString: 'Top selling products', sql };
+                const result = await this.executeQuery(quickQuery, dbConnection);
+                finalData = result;
+                executedQueries.push({ queryObject: quickQuery, result });
+              }
+            } catch (e: any) {
+              logger.warn(`Insight query failed, falling back to plan: ${e.message}`);
+            }
+          }
+
+          // If no insight data fetched, run the planned execution
+          const execution = finalData == null
+            ? await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery)
+            : { finalData, executedQueries, toolOutputs } as any;
           finalData = execution.finalData;
           executedQueries = execution.executedQueries;
           toolOutputs = execution.toolOutputs;
@@ -149,7 +195,7 @@ export class AIAgentService {
       } catch (planError: any) {
         logger.warn(`Plan-execute flow failed, falling back to single-shot: ${planError.message}`);
         // Fallback to single-shot query generation
-        const queryObject = await this.generateQuery(userQuery, schemaInfo, memoryInsights, dbConnection.type);
+        const queryObject = await this.generateQuery(userQuery, schemaInfo, { ...memoryInsights, capabilitySummary, schemaHints }, dbConnection.type);
         if (dbOptions.dryRun) {
           executedQueries = [{ queryObject, result: null }];
         } else {
