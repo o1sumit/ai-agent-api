@@ -2,7 +2,7 @@ import { hash, compare } from 'bcrypt';
 import { sign } from 'jsonwebtoken';
 import { Service } from 'typedi';
 import { SECRET_KEY } from '@config';
-import { HttpException } from '@exceptions/httpException';
+import { HttpException } from '@exceptions/HttpException';
 import { DataStoredInToken, TokenData } from '@interfaces/auth.interface';
 import { User } from '@interfaces/users.interface';
 import { UserModel } from '@models/users.model';
@@ -20,14 +20,23 @@ const createCookie = (tokenData: TokenData): string => {
 
 @Service()
 export class AuthService {
-  public async signup(userData: User): Promise<User> {
+  public async signup(userData: User): Promise<{ cookie: string; token: string; findUser: User }> {
+    // Check if email already exists
     const findUser: User = await UserModel.findOne({ email: userData.email });
     if (findUser) throw new HttpException(409, `This email ${userData.email} already exists`);
+
+    // Check if username already exists
+    const findUsername: User = await UserModel.findOne({ username: userData.username });
+    if (findUsername) throw new HttpException(409, `This username ${userData.username} already exists`);
 
     const hashedPassword = await hash(userData.password, 10);
     const createUserData: User = await UserModel.create({ ...userData, password: hashedPassword });
 
-    return createUserData;
+    // Generate token and cookie for immediate login after signup
+    const tokenData = createToken(createUserData);
+    const cookie = createCookie(tokenData);
+
+    return { cookie, token: tokenData.token, findUser: createUserData };
   }
 
   public async login(userData: User): Promise<{ cookie: string; token: string; findUser: User }> {
