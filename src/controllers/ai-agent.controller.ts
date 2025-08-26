@@ -122,4 +122,30 @@ export class AIAgentController {
       next(error);
     }
   };
+
+  public profileDatabase = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { dbUrl, dbType } = req.body as any;
+      if (!dbUrl || typeof dbUrl !== 'string' || dbUrl.trim().length === 0) {
+        return res.status(400).json({ message: 'dbUrl is required and must be a non-empty string' });
+      }
+      const profile = await this.aiAgent.profileDatabase(dbUrl.trim(), dbType);
+      return res.status(200).json(profile);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public checkConnection = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { dbUrl, dbType } = req.body as any;
+      if (!dbUrl || typeof dbUrl !== 'string' || dbUrl.trim().length === 0) {
+        return res.status(400).json({ message: 'dbUrl is required and must be a non-empty string' });
+      }
+      const status = await this.aiAgent.testConnection(dbUrl.trim(), dbType);
+      return res.status(200).json(status);
+    } catch (error) {
+      next(error);
+    }
+  };
 }

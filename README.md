@@ -426,3 +426,19 @@ Verbose example (debugging):
 - `PG_POOL_MAX` (default 10)
 - `LOG_DIR` (default `logs`)
 
+### Environment
+
+Add to your `.env.development.local` (and/or production env):
+
+```
+GOOGLE_API_KEY=your_key
+GOOGLE_MODEL=gemini-1.5-flash
+```
+
+- Recommended free/low-cost models:
+  - gemini-1.5-flash-8b (fast, very low cost)
+  - gemini-1.5-flash (balanced)
+  - gemini-2.0-flash (newer; often limited free quota)
+
+If unset, the default is `gemini-1.5-flash`.
+

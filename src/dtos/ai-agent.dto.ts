@@ -30,3 +30,14 @@ export class AIFeedbackDto {
   @IsIn(['positive', 'negative'])
   public feedback: 'positive' | 'negative';
 }
+
+export class ProfileDbDto {
+  @IsString()
+  @IsNotEmpty()
+  public dbUrl: string;
+
+  @IsString()
+  @IsOptional()
+  @IsIn(['mongodb', 'postgres', 'mysql'])
+  public dbType?: 'mongodb' | 'postgres' | 'mysql';
+}

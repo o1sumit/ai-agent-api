@@ -34,6 +34,28 @@ export class DbPoolService {
         }
     }
 
+    /**
+     * Returns status of an existing or newly created connection for the given URL.
+     * Does not create multiple pools/connections for the same URL.
+     */
+    public async getConnectionStatus(dbUrl: string, dbType?: DBType): Promise<{ ok: boolean; type?: DBType; details?: any }> {
+        try {
+            const conn = await this.get(dbUrl, dbType);
+            if (conn.type === 'mongodb') {
+                return { ok: (conn.mongo.readyState === 1), type: 'mongodb', details: { readyState: conn.mongo.readyState } } as any;
+            }
+            if (conn.type === 'postgres') {
+                return { ok: true, type: 'postgres', details: { totalCount: (conn.pg as any).totalCount } } as any;
+            }
+            if (conn.type === 'mysql') {
+                return { ok: true, type: 'mysql' } as any;
+            }
+            return { ok: false };
+        } catch (e: any) {
+            return { ok: false, details: { error: e.message } };
+        }
+    }
+
     private parseDbType(dbUrl: string): DBType | null {
         const lower = dbUrl.toLowerCase();
         if (lower.startsWith('mongodb://') || lower.startsWith('mongodb+srv://')) return 'mongodb';

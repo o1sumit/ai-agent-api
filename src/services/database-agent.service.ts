@@ -1,4 +1,4 @@
-import { GOOGLE_API_KEY, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS } from '@config';
+import { GOOGLE_API_KEY, GOOGLE_MODEL, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS } from '@config';
 import { AgentResponse, AgentState, DatabaseTool } from '@interfaces/chat.interface';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { DynamicTool } from '@langchain/core/tools';
@@ -23,7 +23,7 @@ export class DatabaseAgentService {
   constructor() {
     this.llm = new ChatGoogleGenerativeAI({
       apiKey: GOOGLE_API_KEY,
-      model: 'gemini-1.5-flash',
+      model: GOOGLE_MODEL,
       temperature: 0.1,
     });
 

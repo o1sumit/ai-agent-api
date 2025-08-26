@@ -1,7 +1,7 @@
 import { Service } from 'typedi';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
-import { GOOGLE_API_KEY, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS, REDACT_SQL_IN_RESPONSES } from '@config';
+import { GOOGLE_API_KEY, GOOGLE_MODEL, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS, REDACT_SQL_IN_RESPONSES } from '@config';
 import { HttpException } from '@exceptions/HttpException';
 import { SchemaDetectorService } from './schema-detector.service';
 import { SQLSchemaDetectorService } from './sql-schema-detector.service';
@@ -14,6 +14,7 @@ import { SchemaRegistryService } from './schema-registry.service';
 import { SqlInsightService } from './sql-insight.service';
 import { DataProfilerService } from './data-profiler.service';
 import { SchemaKeywordMatcherService } from './schema-keyword-matcher.service';
+import { Container } from 'typedi';
 
 type PlanStep =
   | {
@@ -58,19 +59,20 @@ export class AIAgentService {
   private schemaMatcher: SchemaKeywordMatcherService;
 
   constructor() {
+    // LLM is optional; when missing we'll use heuristic fallbacks
     if (!GOOGLE_API_KEY) {
-      throw new HttpException(500, 'Google API key is not configured');
+      logger.warn('GOOGLE_API_KEY not set. Falling back to heuristic planning/generation without LLM.');
+    } else {
+      this.llm = new ChatGoogleGenerativeAI({
+        apiKey: GOOGLE_API_KEY,
+        model: GOOGLE_MODEL,
+        temperature: 0.1,
+      });
     }
-
-    this.llm = new ChatGoogleGenerativeAI({
-      apiKey: GOOGLE_API_KEY,
-      model: 'gemini-1.5-flash',
-      temperature: 0.1,
-    });
 
     this.schemaDetector = new SchemaDetectorService();
     this.sqlSchemaDetector = new SQLSchemaDetectorService();
-    this.dbPool = new DbPoolService();
+    this.dbPool = Container.get(DbPoolService);
     this.memoryService = new AIMemoryService();
     this.schemaRegistry = new SchemaRegistryService();
     this.sqlInsight = new SqlInsightService();
@@ -140,10 +142,10 @@ export class AIAgentService {
         logger.warn(`Profiling failed: ${e.message}`);
       }
 
-      // Lightweight keyword-to-schema candidates (primarily for Mongo collections)
+      // Lightweight keyword-to-schema candidates leveraging parsed schema for any DB
       let schemaHints: any = null;
       try {
-        schemaHints = await this.schemaMatcher.match(userQuery, dbConnection);
+        schemaHints = await this.schemaMatcher.match(userQuery, { schemaJson: schemaInfo, dbType: dbConnection.type, dbConnection });
       } catch (e: any) {
         logger.warn(`Schema keyword match failed: ${e.message}`);
       }
@@ -238,12 +240,14 @@ export class AIAgentService {
         logger.warn(`Memory record failed: ${memErr.message}`);
       }
 
-      // Generate final response message using LLM if we have tool outputs; otherwise default
-      let finalMessage = dbOptions.dryRun ? 'Preview generated successfully' : 'Query executed successfully';
-      try {
-        finalMessage = await this.generateFinalResponseMessage(userQuery, executedQueries, toolOutputs, memoryInsights);
-      } catch (composeErr: any) {
-        logger.warn(`Failed to compose final response, using default message: ${composeErr.message}`);
+      // Generate final response message using LLM if available; otherwise default
+      let finalMessage = dbOptions.dryRun ? 'Preview generated successfully' : `Retrieved ${resultCount} record(s)`;
+      if (this.llm) {
+        try {
+          finalMessage = await this.generateFinalResponseMessage(userQuery, executedQueries, toolOutputs, memoryInsights);
+        } catch (composeErr: any) {
+          logger.warn(`Failed to compose final response, using default message: ${composeErr.message}`);
+        }
       }
 
       return {
@@ -328,6 +332,12 @@ User Query:\n"${userQuery}"
 Database Schema:\n${schemaInfo}
 
 User Context:\n${JSON.stringify(memoryInsights || {}, null, 2)}
+
+Important Notes About Database Schema JSON:
+- SQL schemas include keys: table (e.g. schema.table), columns [{ column_name, data_type, is_nullable }], primary_key [..], foreign_keys [{ column_name, references_table, references_column }].
+- Prefer joins based on foreign_keys instead of ad-hoc matching.
+- Use table names exactly as they appear in the schema JSON (keep schema prefixes where present).
+- For MongoDB, collection schemas include relationships (reference/potential_reference). Consider using $lookup when relationships are provided.
 
 ${toolsDescription}
 
@@ -550,10 +560,62 @@ Guidelines:
       memoryContext += `\n\nSuggestions based on user history:\n${memoryInsights.suggestions.join('\n- ')}`;
     }
 
+    // If LLM is unavailable, use heuristic generator
+    if (!this.llm) {
+      return this.generateHeuristicQuery(userQuery, schemaInfo, dbType);
+    }
+
     if (dbType === 'mongodb') {
       return this.generateMongoQuery(userQuery, schemaInfo, memoryContext);
     } else {
       return this.generateSQLQuery(userQuery, schemaInfo, memoryContext, dbType);
+    }
+  }
+
+  // Heuristic generator for when no LLM is available
+  private async generateHeuristicQuery(userQuery: string, schemaInfo: string, dbType: DBType): Promise<MongoQueryObject | SQLQueryObject> {
+    const text = (userQuery || '').toLowerCase();
+    // Extract likely collection/table keyword
+    const names: string[] = [];
+    try {
+      const parsed = JSON.parse(schemaInfo);
+      if (Array.isArray(parsed)) {
+        if (dbType === 'mongodb') {
+          for (const s of parsed) if ((s as any)?.collection) names.push(String((s as any).collection).toLowerCase());
+        } else {
+          for (const t of parsed) if ((t as any)?.table) names.push(String((t as any).table).toLowerCase());
+        }
+      }
+    } catch {}
+
+    const pickName = (): string | undefined => {
+      const tokens = text.split(/[^a-z0-9_.]+/g).filter(Boolean);
+      const scored = names
+        .map(n => ({ n, score: tokens.some(t => n.includes(t)) ? n.length : 0 }))
+        .sort((a, b) => b.score - a.score);
+      return scored[0]?.score ? scored[0].n : undefined;
+    };
+
+    const wantCount = /\bcount|how many\b/.test(text);
+    const wantLatest = /\b(latest|recent|newest)\b/.test(text);
+    const wantLimit = /\btop|first\b/.test(text);
+
+    if (dbType === 'mongodb') {
+      const collection = (pickName() || 'users').replace(/^.*\./, '');
+      if (wantCount) return { operation: 'count', queryString: 'Count documents', collection } as any;
+      const filter: any = {};
+      const sort = wantLatest ? { createdAt: -1 } : undefined;
+      const limit = wantLimit ? 10 : 100;
+      return { operation: 'find', queryString: 'Heuristic find', collection, filter, sort, limit, projection: { password: 0 } } as any;
+    } else {
+      const tableFull = pickName() || (dbType === 'postgres' ? 'public.users' : 'users');
+      const table = tableFull;
+      if (wantCount) {
+        return { operation: 'sql', queryString: 'Count rows', sql: `SELECT COUNT(*) AS count FROM ${table}`, parameters: [] } as any;
+      }
+      const order = wantLatest ? ' ORDER BY created_at DESC' : '';
+      const limit = wantLimit ? ' LIMIT 10' : ' LIMIT 100';
+      return { operation: 'sql', queryString: 'Heuristic select', sql: `SELECT * FROM ${table}${order}${limit}`, parameters: [] } as any;
     }
   }
 
@@ -573,6 +635,9 @@ Strong Safety Rules:
 5) For aggregates, do not use $out/$merge stages.
 6) For reads, prefer minimal projections (exclude sensitive fields).
 7) Always specify the collection name.
+
+Relationship Guidance:
+- If schema relationships indicate references between collections, prefer aggregation with $lookup to join related data. Use indexed fields for join keys when possible.
 
 Output JSON Format (pick the appropriate fields per operation):
 {
@@ -656,6 +721,11 @@ Strong Safety Rules:
   "sql": "SELECT * FROM table_name WHERE condition",
   "parameters": [optional array of parameters for parameterized queries]
 }
+
+Relationship and Naming Guidance:
+- The schema JSON includes: table, columns, primary_key, foreign_keys. When joining, prefer the foreign_keys provided rather than guessing.
+- Use table names exactly as listed in Database Schema, including schema prefixes (e.g., public.users) when present.
+- Prefer qualified column names (table.column) to avoid ambiguity in joins.
 
 Important:
 - Always use proper SQL syntax for ${dbType.toUpperCase()}
@@ -930,5 +1000,19 @@ Examples:
 
   public async refreshSchemaCache(): Promise<void> {
     await this.schemaDetector.refreshCache();
+  }
+
+  // Explicit profiling endpoint: returns normalized schema JSON and capability summary
+  public async profileDatabase(dbUrl: string, dbType?: DBType): Promise<{ schema: string; capabilitySummary: string; dbType: DBType }> {
+    const conn = await this.dbPool.get(dbUrl, dbType);
+    const effectiveType = conn.type as DBType;
+    const schema = await this.schemaRegistry.getOrBuildSchemaString(dbUrl, effectiveType, conn, true);
+    const capabilitySummary = await this.profiler.getCapabilitiesSummary(conn);
+    return { schema, capabilitySummary, dbType: effectiveType };
+  }
+
+  // Lightweight connection check (reuses pool/connection, will not create duplicates for same URL)
+  public async testConnection(dbUrl: string, dbType?: DBType): Promise<{ ok: boolean; type?: DBType; details?: any }> {
+    return this.dbPool.getConnectionStatus(dbUrl, dbType);
   }
 }

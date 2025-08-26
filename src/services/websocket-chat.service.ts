@@ -6,6 +6,8 @@ import jwt from 'jsonwebtoken';
 import { SECRET_KEY } from '@config';
 import { ChatMessageModel, ChatSessionModel } from '@models/chat.model';
 import { DatabaseAgentService } from './database-agent.service';
+import { AIAgentService } from './ai-agent.service';
+import { Container } from 'typedi';
 import { AIMemoryService } from './ai-memory.service';
 import { ChatMessage, ChatSession, WebSocketEvents, ChatServiceConfig } from '@interfaces/chat.interface';
 import { logger } from '@utils/logger';
@@ -172,7 +174,7 @@ export class WebSocketChatService {
           let agentResponse;
           if (effectiveDbUrl) {
             // Route to AI Agent multi-DB flow using session-bound context
-            const aiAgent = new (require('./ai-agent.service').AIAgentService)();
+            const aiAgent = Container.get(AIAgentService);
             const result = await aiAgent.processQuery(message, userId, { dbUrl: effectiveDbUrl, dbType: effectiveDbType, dryRun });
             agentResponse = {
               message: result.message || (typeof result?.data === 'object' ? JSON.stringify(result.data) : String(result?.data ?? '')),
