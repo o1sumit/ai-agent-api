@@ -27,5 +27,3 @@ const SchemaRegistrySchema: Schema = new Schema(
 );
 
 export const SchemaRegistryModel = model<SchemaRegistryDoc>('SchemaRegistry', SchemaRegistrySchema);
-
-

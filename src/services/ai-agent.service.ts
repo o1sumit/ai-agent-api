@@ -174,7 +174,10 @@ export class AIAgentService {
           // Heuristic: if the user asks for top/most selling product and DB is SQL, attempt an insight-first query
           if (dbConnection.type !== 'mongodb' && /most\s+selling|top\s+selling|best\s+selling/i.test(userQuery)) {
             try {
-              const sql = await this.sqlInsight.getTopSellingSQL(dbConnection.type, dbConnection.type === 'postgres' ? dbConnection.pg : dbConnection.mysql);
+              const sql = await this.sqlInsight.getTopSellingSQL(
+                dbConnection.type,
+                dbConnection.type === 'postgres' ? dbConnection.pg : dbConnection.mysql,
+              );
               if (sql) {
                 const quickQuery: SQLQueryObject = { operation: 'sql', queryString: 'Top selling products', sql };
                 const result = await this.executeQuery(quickQuery, dbConnection);
@@ -187,9 +190,10 @@ export class AIAgentService {
           }
 
           // If no insight data fetched, run the planned execution
-          const execution = finalData == null
-            ? await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery)
-            : { finalData, executedQueries, toolOutputs } as any;
+          const execution =
+            finalData == null
+              ? await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery)
+              : ({ finalData, executedQueries, toolOutputs } as any);
           finalData = execution.finalData;
           executedQueries = execution.executedQueries;
           toolOutputs = execution.toolOutputs;
@@ -219,7 +223,7 @@ export class AIAgentService {
             userQuery,
             first.queryString,
             (first as any).operation,
-            dbConnection.type === 'mongodb' ? [((first as MongoQueryObject).collection || 'unknown')] : ['sql_table'],
+            dbConnection.type === 'mongodb' ? [(first as MongoQueryObject).collection || 'unknown'] : ['sql_table'],
             executionTime,
             resultCount,
             true,
@@ -311,10 +315,7 @@ Respond briefly and warmly, offer help, and mention you can:
 - query connected databases (when provided)
 - perform light data analysis and recommendations.
 Do not include raw data or technical details. Keep it to 1-2 short sentences.`;
-    const res = await this.llm.invoke([
-      new SystemMessage(prompt),
-      new HumanMessage('Please reply with 1-2 short sentences only.'),
-    ]);
+    const res = await this.llm.invoke([new SystemMessage(prompt), new HumanMessage('Please reply with 1-2 short sentences only.')]);
     return res.content.toString();
   }
 
@@ -354,10 +355,7 @@ Rules:
   ]
 }`;
 
-    const response = await this.llm.invoke([
-      new SystemMessage(planningPrompt),
-      new HumanMessage('Return only the JSON object for the plan.'),
-    ]);
+    const response = await this.llm.invoke([new SystemMessage(planningPrompt), new HumanMessage('Return only the JSON object for the plan.')]);
     const raw = response.content.toString();
     const sanitized = this.sanitizeJsonContent(raw);
     const match = sanitized.match(/\{[\s\S]*\}/);
@@ -500,10 +498,7 @@ ${sample.map((s, idx) => `Dataset ${idx}:\n${JSON.stringify(s, null, 2)}`).join(
 Instructions: ${instructions}
 
 Provide a concise analysis and, if applicable, recommendations grounded in the data. Do not include raw JSON in the final message.`;
-    const res = await this.llm.invoke([
-      new SystemMessage(prompt),
-      new HumanMessage('Provide a concise analysis and recommendations.'),
-    ]);
+    const res = await this.llm.invoke([new SystemMessage(prompt), new HumanMessage('Provide a concise analysis and recommendations.')]);
     return res.content.toString();
   }
 
@@ -513,7 +508,11 @@ Provide a concise analysis and, if applicable, recommendations grounded in the d
     toolOutputs: Array<{ stepIndex: number; type: string; output: any }>,
     memoryInsights: any,
   ): Promise<string> {
-    const querySummaries = executedQueries.map((q, i) => ({ index: i, description: q.queryObject.queryString, rows: Array.isArray(q.result) ? q.result.length : (q.result ? 1 : 0) }));
+    const querySummaries = executedQueries.map((q, i) => ({
+      index: i,
+      description: q.queryObject.queryString,
+      rows: Array.isArray(q.result) ? q.result.length : q.result ? 1 : 0,
+    }));
     const previewOutputs = toolOutputs.slice(-5); // last few tool outputs
     const prompt = `Summarize the results for the user.
 
@@ -527,14 +526,16 @@ Guidelines:
 - If analysis/recommendations are available, include them briefly.
 - Avoid raw JSON; present findings in plain language.
 `;
-    const res = await this.llm.invoke([
-      new SystemMessage(prompt),
-      new HumanMessage('Write a short final message for the user.'),
-    ]);
+    const res = await this.llm.invoke([new SystemMessage(prompt), new HumanMessage('Write a short final message for the user.')]);
     return res.content.toString();
   }
 
-  private async generateQuery(userQuery: string, schemaInfo: string, memoryInsights: any, dbType: DBType): Promise<MongoQueryObject | SQLQueryObject> {
+  private async generateQuery(
+    userQuery: string,
+    schemaInfo: string,
+    memoryInsights: any,
+    dbType: DBType,
+  ): Promise<MongoQueryObject | SQLQueryObject> {
     // Build context from memory
     let memoryContext = '';
     if (memoryInsights.similarQueries.length > 0) {
@@ -590,9 +591,7 @@ Guidelines:
 
     const pickName = (): string | undefined => {
       const tokens = text.split(/[^a-z0-9_.]+/g).filter(Boolean);
-      const scored = names
-        .map(n => ({ n, score: tokens.some(t => n.includes(t)) ? n.length : 0 }))
-        .sort((a, b) => b.score - a.score);
+      const scored = names.map(n => ({ n, score: tokens.some(t => n.includes(t)) ? n.length : 0 })).sort((a, b) => b.score - a.score);
       return scored[0]?.score ? scored[0].n : undefined;
     };
 
@@ -698,7 +697,12 @@ Examples:
     }
   }
 
-  private async generateSQLQuery(userQuery: string, schemaInfo: string, memoryContext: string, dbType: 'postgres' | 'mysql'): Promise<SQLQueryObject> {
+  private async generateSQLQuery(
+    userQuery: string,
+    schemaInfo: string,
+    memoryContext: string,
+    dbType: 'postgres' | 'mysql',
+  ): Promise<SQLQueryObject> {
     const systemPrompt = `You are a strict, safety-first ${dbType.toUpperCase()} SQL generator. Generate optimized and SAFE SQL (CRUD and analysis) from natural language, the database schema, and user history.
 
 Database Schema:
@@ -891,14 +895,12 @@ Examples:
         const containsDangerousMongo = (obj: any): boolean => {
           if (!obj || typeof obj !== 'object') return false;
           if (Array.isArray(obj)) return obj.some(containsDangerousMongo);
-          return Object.keys(obj).some(k =>
-            k === '$where' || k === '$function' || (typeof obj[k] === 'object' && containsDangerousMongo(obj[k]))
-          );
+          return Object.keys(obj).some(k => k === '$where' || k === '$function' || (typeof obj[k] === 'object' && containsDangerousMongo(obj[k])));
         };
         if (containsDangerousMongo(filter)) {
           throw new Error('Dangerous Mongo operator in filter is blocked');
         }
-        
+
         // Get the appropriate model
         const model = this.getModelForCollection(collection, dbConnection.mongo);
 
@@ -955,7 +957,7 @@ Examples:
 
   private getModelForCollection(collectionName: string, conn?: mongoose.Connection): any {
     const connection = conn || mongoose.connection;
-    
+
     // Try to find existing mongoose model
     const existingModel = Object.values(connection.models).find((model: any) => model.collection.name === collectionName);
 

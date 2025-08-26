@@ -136,10 +136,7 @@ Respond briefly and warmly (1-2 short sentences). Offer help and mention you can
 - query connected databases
 - perform light data analysis and recommendations.
 Do not include any raw data or technical details.`;
-      const res = await this.llm.invoke([
-        new SystemMessage(prompt),
-        new HumanMessage('Please reply with 1-2 short sentences only.'),
-      ]);
+      const res = await this.llm.invoke([new SystemMessage(prompt), new HumanMessage('Please reply with 1-2 short sentences only.')]);
       return res.content.toString();
     } catch (e: any) {
       return 'Hi! How can I help you today? I can answer questions or analyze your data.';
@@ -219,10 +216,7 @@ ${state.tools.map(tool => `- ${tool.name}: ${tool.description}`).join('\n')}
 
 Create a step-by-step plan to answer the user's query effectively.`;
 
-    const plan = await this.llm.invoke([
-      new SystemMessage(planningPrompt),
-      new HumanMessage('Return only the plan text.'),
-    ]);
+    const plan = await this.llm.invoke([new SystemMessage(planningPrompt), new HumanMessage('Return only the plan text.')]);
 
     logger.info(`plan_execution completed in ${Date.now() - started}ms`);
     return {
@@ -322,10 +316,7 @@ Provide a clear, helpful response that:
 
 Response format should be conversational and user-friendly.`;
 
-    const response = await this.llm.invoke([
-      new SystemMessage(responsePrompt),
-      new HumanMessage('Write a concise, friendly response.'),
-    ]);
+    const response = await this.llm.invoke([new SystemMessage(responsePrompt), new HumanMessage('Write a concise, friendly response.')]);
 
     const finalResponse: AgentResponse = {
       message: response.content.toString(),
@@ -486,7 +477,7 @@ Response format should be conversational and user-friendly.`;
 
   private sanitizeJsonContent(text: string): string {
     return (text || '')
-      .replace(/```json[\s\S]*?```/g, (m) => m.replace(/```json|```/g, ''))
+      .replace(/```json[\s\S]*?```/g, m => m.replace(/```json|```/g, ''))
       .replace(/\bTrue\b/g, 'true')
       .replace(/\bFalse\b/g, 'false');
   }

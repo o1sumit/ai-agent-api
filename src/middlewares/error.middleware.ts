@@ -10,7 +10,7 @@ export const ErrorMiddleware = (error: HttpException, req: Request, res: Respons
     const requestId = (req as any).requestId;
     const meta: any = { requestId, method: req.method, path: req.path, status };
     if (error && (error as any).stack) meta.stack = (error as any).stack;
-    logger.error(`[${req.method}] ${req.path} >> StatusCode:: ${status}, Message:: ${message}` , meta);
+    logger.error(`[${req.method}] ${req.path} >> StatusCode:: ${status}, Message:: ${message}`, meta);
     res.status(status).json({ message });
   } catch (error) {
     next(error);

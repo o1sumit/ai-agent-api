@@ -74,7 +74,40 @@ export class SchemaKeywordMatcherService {
   }
 
   private extractKeywords(query: string): string[] {
-    const stop = new Set(['get','find','show','all','the','a','an','and','or','but','in','on','at','to','for','of','with','by','is','are','be','can','most','top','best','over','last','from','this','that','these','those']);
+    const stop = new Set([
+      'get',
+      'find',
+      'show',
+      'all',
+      'the',
+      'a',
+      'an',
+      'and',
+      'or',
+      'but',
+      'in',
+      'on',
+      'at',
+      'to',
+      'for',
+      'of',
+      'with',
+      'by',
+      'is',
+      'are',
+      'be',
+      'can',
+      'most',
+      'top',
+      'best',
+      'over',
+      'last',
+      'from',
+      'this',
+      'that',
+      'these',
+      'those',
+    ]);
     return (query || '')
       .toLowerCase()
       .split(/[^a-z0-9_]+/)
@@ -85,5 +118,3 @@ export class SchemaKeywordMatcherService {
     return keywords.some(k => name.includes(k) || fields.some(f => f.includes(k)));
   }
 }
-
-

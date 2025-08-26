@@ -10,15 +10,15 @@ describe('Testing Application', () => {
 
     it('should validate field requirements', () => {
       const { CreateUserDto } = require('@dtos/users.dto');
-      
+
       // Test that TypeScript enforces the new required fields
       const userData = {
         fullName: 'Test User',
-        username: 'testuser', 
+        username: 'testuser',
         email: 'test@example.com',
-        password: 'password123'
+        password: 'password123',
       };
-      
+
       expect(userData.fullName).toBeDefined();
       expect(userData.username).toBeDefined();
       expect(userData.email).toBeDefined();

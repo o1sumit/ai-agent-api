@@ -43,22 +43,26 @@ export class DataProfilerService {
     if (hasOrders && hasDate && (hasPrice || hasQty)) caps.push('revenue_over_time');
     if (hasOrders) caps.push('order_counts');
 
-    return `Collections: ${schemas.map(s => s.collection).join(', ')}\nCapabilities: ${caps.join(', ') || 'basic_find'}\nSignals: qty=${hasQty}, price=${hasPrice}, date=${hasDate}`;
+    return `Collections: ${schemas.map(s => s.collection).join(', ')}\nCapabilities: ${
+      caps.join(', ') || 'basic_find'
+    }\nSignals: qty=${hasQty}, price=${hasPrice}, date=${hasDate}`;
   }
 
   private async profileSQL(dbType: SqlType, pool: any): Promise<string> {
-    const tableQuery = dbType === 'postgres'
-      ? `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema')`
-      : `SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()`;
+    const tableQuery =
+      dbType === 'postgres'
+        ? `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema')`
+        : `SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()`;
 
-    const colQuery = dbType === 'postgres'
-      ? `SELECT table_schema, table_name, column_name FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog','information_schema')`
-      : `SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE()`;
+    const colQuery =
+      dbType === 'postgres'
+        ? `SELECT table_schema, table_name, column_name FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog','information_schema')`
+        : `SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE()`;
 
     const tables = dbType === 'postgres' ? (await pool.query(tableQuery)).rows : (await pool.query(tableQuery))[0];
     const cols = dbType === 'postgres' ? (await pool.query(colQuery)).rows : (await pool.query(colQuery))[0];
 
-    const fullNames: string[] = tables.map((t: any) => dbType === 'postgres' ? `${t.table_schema}.${t.table_name}` : t.table_name);
+    const fullNames: string[] = tables.map((t: any) => (dbType === 'postgres' ? `${t.table_schema}.${t.table_name}` : t.table_name));
     const tableToCols = new Map<string, Set<string>>();
     for (const c of cols) {
       const t = dbType === 'postgres' ? `${c.table_schema}.${c.table_name}` : c.table_name;
@@ -66,8 +70,7 @@ export class DataProfilerService {
       tableToCols.get(t)!.add(String(c.column_name).toLowerCase());
     }
 
-    const candidates = fullNames.map(t => ({ name: t, score: this.scoreTable(tableToCols.get(t) || new Set()) }))
-      .sort((a, b) => b.score - a.score);
+    const candidates = fullNames.map(t => ({ name: t, score: this.scoreTable(tableToCols.get(t) || new Set()) })).sort((a, b) => b.score - a.score);
 
     const topTables = candidates.slice(0, 8).map(c => c.name);
 
@@ -83,7 +86,9 @@ export class DataProfilerService {
     if (hasDate && (hasPrice || hasQty)) caps.push('revenue_over_time');
     if (hasDate) caps.push('activity_over_time');
 
-    return `Tables: ${topTables.join(', ')}\nCapabilities: ${caps.join(', ') || 'basic_sql'}\nSignals: qty=${hasQty}, price=${hasPrice}, date=${hasDate}, productRef=${hasProductRef}`;
+    return `Tables: ${topTables.join(', ')}\nCapabilities: ${
+      caps.join(', ') || 'basic_sql'
+    }\nSignals: qty=${hasQty}, price=${hasPrice}, date=${hasDate}, productRef=${hasProductRef}`;
   }
 
   private scoreTable(cols: Set<string>): number {
@@ -99,5 +104,3 @@ export class DataProfilerService {
     return s;
   }
 }
-
-

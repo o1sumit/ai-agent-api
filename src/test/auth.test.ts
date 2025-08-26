@@ -18,7 +18,7 @@ describe('Testing Auth Service', () => {
       };
 
       const authService = new AuthService();
-      
+
       // Test that the service accepts the new fields
       expect(userData.fullName).toBe('Test User');
       expect(userData.username).toBe('testuser');

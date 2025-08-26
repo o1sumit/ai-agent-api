@@ -67,7 +67,8 @@ LIMIT 5`;
   }
 
   private async inferSalesSchema(dbType: 'postgres' | 'mysql', pool: any): Promise<SalesInsight> {
-    const like = (col: string, patterns: string[]) => patterns.map(p => `${col} ${dbType === 'postgres' ? `ILIKE '%${p}%'` : `LIKE '%${p}%'`}`).join(' OR ');
+    const like = (col: string, patterns: string[]) =>
+      patterns.map(p => `${col} ${dbType === 'postgres' ? `ILIKE '%${p}%'` : `LIKE '%${p}%'`}`).join(' OR ');
     let rows: Array<{ table_schema?: string; table_name: string; column_name: string }>; // mysql has no schema field in our query
 
     if (dbType === 'postgres') {
@@ -75,8 +76,23 @@ LIMIT 5`;
         `SELECT table_schema, table_name, column_name
          FROM information_schema.columns
          WHERE table_type IS NULL OR table_schema NOT IN ('pg_catalog','information_schema')
-           AND (${like('column_name', ['product_id','productid','sku','item_id','order_id','quantity','qty','price','unit_price','amount','total','revenue','name','title'])})
-         ORDER BY table_schema, table_name`
+           AND (${like('column_name', [
+             'product_id',
+             'productid',
+             'sku',
+             'item_id',
+             'order_id',
+             'quantity',
+             'qty',
+             'price',
+             'unit_price',
+             'amount',
+             'total',
+             'revenue',
+             'name',
+             'title',
+           ])})
+         ORDER BY table_schema, table_name`,
       );
       rows = res.rows;
     } else {
@@ -84,8 +100,23 @@ LIMIT 5`;
         `SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name
          FROM information_schema.columns
          WHERE TABLE_SCHEMA = DATABASE()
-           AND (${like('COLUMN_NAME', ['product_id','productid','sku','item_id','order_id','quantity','qty','price','unit_price','amount','total','revenue','name','title'])})
-         ORDER BY TABLE_SCHEMA, TABLE_NAME`
+           AND (${like('COLUMN_NAME', [
+             'product_id',
+             'productid',
+             'sku',
+             'item_id',
+             'order_id',
+             'quantity',
+             'qty',
+             'price',
+             'unit_price',
+             'amount',
+             'total',
+             'revenue',
+             'name',
+             'title',
+           ])})
+         ORDER BY TABLE_SCHEMA, TABLE_NAME`,
       );
       rows = res as any[];
     }
@@ -104,9 +135,9 @@ LIMIT 5`;
     const lineItemTables: string[] = [];
     for (const [table, cols] of tableToCols.entries()) {
       const lname = table.toLowerCase();
-      if (lname.includes('product') && hasAny(cols, ['name','title','sku'])) productTables.push(table);
-      const hasProdKey = hasAny(cols, ['product_id','productid','sku','item_id']);
-      const hasQtyOrMoney = hasAny(cols, ['quantity','qty','price','unit_price','amount','total']);
+      if (lname.includes('product') && hasAny(cols, ['name', 'title', 'sku'])) productTables.push(table);
+      const hasProdKey = hasAny(cols, ['product_id', 'productid', 'sku', 'item_id']);
+      const hasQtyOrMoney = hasAny(cols, ['quantity', 'qty', 'price', 'unit_price', 'amount', 'total']);
       if (hasProdKey && hasQtyOrMoney) lineItemTables.push(table);
     }
 
@@ -115,15 +146,15 @@ LIMIT 5`;
     insight.lineItemsTable = lineItemTables[0];
     if (insight.lineItemsTable) {
       const liCols = tableToCols.get(insight.lineItemsTable)!;
-      insight.liProductKey = pickFirst(liCols, ['product_id','productid','sku','item_id']);
-      insight.qtyColumn = pickFirst(liCols, ['quantity','qty']);
-      insight.priceColumn = pickFirst(liCols, ['unit_price','price']);
-      insight.amountColumn = pickFirst(liCols, ['amount','total']);
+      insight.liProductKey = pickFirst(liCols, ['product_id', 'productid', 'sku', 'item_id']);
+      insight.qtyColumn = pickFirst(liCols, ['quantity', 'qty']);
+      insight.priceColumn = pickFirst(liCols, ['unit_price', 'price']);
+      insight.amountColumn = pickFirst(liCols, ['amount', 'total']);
     }
     if (insight.productsTable) {
       const pCols = tableToCols.get(insight.productsTable)!;
-      insight.productKey = pickFirst(pCols, ['id','product_id','sku']);
-      insight.productNameColumn = pickFirst(pCols, ['name','title','sku']) || 'name';
+      insight.productKey = pickFirst(pCols, ['id', 'product_id', 'sku']);
+      insight.productNameColumn = pickFirst(pCols, ['name', 'title', 'sku']) || 'name';
     }
     return insight;
   }
@@ -142,5 +173,3 @@ LIMIT 5`;
     return this.myIdent(tbl);
   }
 }
-
-

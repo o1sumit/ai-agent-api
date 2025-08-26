@@ -13,12 +13,7 @@ export class SchemaRegistryService {
   private sqlSchemaDetector = new SQLSchemaDetectorService();
   private DEFAULT_TTL_MS = SCHEMA_REGISTRY_TTL_MS;
 
-  public async getOrBuildSchemaString(
-    dbUrl: string,
-    dbType: DBType,
-    connection: any,
-    forceRefresh = false,
-  ): Promise<string> {
+  public async getOrBuildSchemaString(dbUrl: string, dbType: DBType, connection: any, forceRefresh = false): Promise<string> {
     const normalizedUrl = this.normalizeUrl(dbUrl, dbType);
     const dbKey = this.hashDbKey(dbType, normalizedUrl);
 
@@ -98,5 +93,3 @@ export class SchemaRegistryService {
     return h.digest('hex');
   }
 }
-
-
