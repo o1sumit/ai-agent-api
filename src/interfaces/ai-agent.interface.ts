@@ -4,6 +4,9 @@ export interface AIQueryRequest {
   query: string;
   dbUrl: string;
   dbType?: DBType;
+  dryRun?: boolean;
+  refreshSchema?: boolean;
+  insight?: boolean;
 }
 
 export interface AIQueryResponse {
@@ -13,6 +16,7 @@ export interface AIQueryResponse {
   suggestions?: string[];
   executionTime?: number;
   memoryInsights?: MemoryInsights;
+  success?: boolean;
 }
 
 export interface SampleQueriesResponse {
@@ -27,6 +31,9 @@ export interface QueryResult {
   suggestions?: string[];
   executionTime?: number;
   memoryInsights?: MemoryInsights;
+  plan?: any;
+  trace?: Array<{ stepIndex: number; type: string; output: any }>;
+  executedQueries?: Array<{ operation: string; queryString: string; sql?: string; collection?: string; filter?: any }>;
 }
 
 export interface MemoryInsights {
@@ -43,6 +50,10 @@ export interface MongoQueryObject {
   projection?: any;
   sort?: any;
   limit?: number;
+  // Optional fields for CRUD operations
+  document?: any; // for insertOne
+  update?: any; // for updateOne
+  options?: any; // optional driver options
 }
 
 export interface SQLQueryObject {

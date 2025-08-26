@@ -1,6 +1,6 @@
 import { hash } from 'bcrypt';
 import { Service } from 'typedi';
-import { HttpException } from '@exceptions/httpException';
+import { HttpException } from '@exceptions/HttpException';
 import { User } from '@interfaces/users.interface';
 import { UserModel } from '@models/users.model';
 
@@ -22,6 +22,9 @@ export class UserService {
     const findUser: User = await UserModel.findOne({ email: userData.email });
     if (findUser) throw new HttpException(409, `This email ${userData.email} already exists`);
 
+    const findUsername: User = await UserModel.findOne({ username: userData.username });
+    if (findUsername) throw new HttpException(409, `This username ${userData.username} already exists`);
+
     const hashedPassword = await hash(userData.password, 10);
     const createUserData: User = await UserModel.create({ ...userData, password: hashedPassword });
 
@@ -32,6 +35,11 @@ export class UserService {
     if (userData.email) {
       const findUser: User = await UserModel.findOne({ email: userData.email });
       if (findUser && findUser._id != userId) throw new HttpException(409, `This email ${userData.email} already exists`);
+    }
+
+    if (userData.username) {
+      const findUsername: User = await UserModel.findOne({ username: userData.username });
+      if (findUsername && findUsername._id != userId) throw new HttpException(409, `This username ${userData.username} already exists`);
     }
 
     if (userData.password) {

@@ -2,6 +2,7 @@ import { model, Schema, Document } from 'mongoose';
 
 export interface AIMemory {
   userId: string;
+  dbKey?: string; // normalized per-db identity
   query: string;
   generatedMongoQuery: string;
   executionTime: number;
@@ -39,6 +40,10 @@ const AIMemorySchema: Schema = new Schema(
     userId: {
       type: String,
       required: true,
+      index: true,
+    },
+    dbKey: {
+      type: String,
       index: true,
     },
     query: {
@@ -122,7 +127,8 @@ const UserPreferencesSchema: Schema = new Schema(
 );
 
 // Indexes for better performance
-AIMemorySchema.index({ userId: 1, timestamp: -1 });
+AIMemorySchema.index({ userId: 1, createdAt: -1 });
+AIMemorySchema.index({ userId: 1, dbKey: 1, createdAt: -1 });
 AIMemorySchema.index({ queryPattern: 1 });
 AIMemorySchema.index({ wasSuccessful: 1 });
 

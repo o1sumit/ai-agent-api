@@ -3,10 +3,12 @@ import compression from 'compression';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import express from 'express';
+import path from 'path';
 import helmet from 'helmet';
 import hpp from 'hpp';
 import morgan from 'morgan';
 import { createServer, Server } from 'http';
+import crypto from 'crypto';
 import swaggerJSDoc from 'swagger-jsdoc';
 import swaggerUi from 'swagger-ui-express';
 import { Container } from 'typedi';
@@ -61,6 +63,12 @@ export class App {
   }
 
   private initializeMiddlewares() {
+    // Request ID middleware for correlation
+    this.app.use((req, _res, next) => {
+      (req as any).requestId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+      next();
+    });
+
     this.app.use(morgan(LOG_FORMAT, { stream }));
     this.app.use(cors({ origin: ORIGIN, credentials: CREDENTIALS }));
     this.app.use(hpp());
@@ -72,6 +80,9 @@ export class App {
   }
 
   private initializeRoutes(routes: Routes[]) {
+    // Serve static playground for WebSocket testing
+    this.app.use('/playground', express.static(path.join(process.cwd(), 'playground')));
+
     routes.forEach(route => {
       this.app.use('/', route.router);
     });

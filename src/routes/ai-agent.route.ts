@@ -3,7 +3,7 @@ import { AIAgentController } from '@controllers/ai-agent.controller';
 import { Routes } from '@interfaces/routes.interface';
 import { ValidationMiddleware } from '@middlewares/validation.middleware';
 import { AuthMiddleware } from '@middlewares/auth.middleware';
-import { AIQueryDto } from '@dtos/ai-agent.dto';
+import { AIQueryDto, ProfileDbDto } from '@dtos/ai-agent.dto';
 
 export class AIAgentRoute implements Routes {
   public path = '/ai-agent';
@@ -32,5 +32,11 @@ export class AIAgentRoute implements Routes {
 
     // POST /ai-agent/refresh-schema - Refresh schema cache (requires authentication)
     this.router.post(`${this.path}/refresh-schema`, AuthMiddleware, this.aiAgent.refreshSchema);
+
+    // POST /ai-agent/profile - Profile DB and return normalized schema (requires authentication)
+    this.router.post(`${this.path}/profile`, AuthMiddleware, ValidationMiddleware(ProfileDbDto), this.aiAgent.profileDatabase);
+
+    // POST /ai-agent/check-connection - Check DB connection status (requires authentication)
+    this.router.post(`${this.path}/check-connection`, AuthMiddleware, ValidationMiddleware(ProfileDbDto), this.aiAgent.checkConnection);
   }
 }

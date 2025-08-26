@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Agent WebSocket Playground</title>
+    <style>
+      :root {
+        --bg: #0f172a; /* slate-900 */
+        --panel: #0b1220; /* custom dark */
+        --border: #1f2937; /* gray-800 */
+        --text: #e2e8f0; /* slate-200 */
+        --muted: #9ca3af; /* gray-400 */
+        --accent: #2563eb; /* blue-600 */
+        --accent-2: #334155; /* slate-600 */
+        --pill-bg: #111827; /* gray-900 */
+        --json-key: #93c5fd; /* blue-300 */
+        --json-str: #86efac; /* green-300 */
+        --json-num: #fcd34d; /* amber-300 */
+        --json-bool: #fca5a5; /* red-300 */
+        --json-null: #c4b5fd; /* violet-300 */
+      }
+      * { box-sizing: border-box; }
+      body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); overflow-x: hidden; }
+      header { padding: 16px 20px; background: #111827; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+      header h1 { margin: 0; font-size: 18px; }
+      .container { padding: 20px; display: grid; gap: 16px; max-width: 1200px; margin: 0 auto; }
+      .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.25); min-width: 0; }
+      .row { display: grid; gap: 12px; grid-template-columns: repeat(12, 1fr); align-items: center; }
+      .col-12 { grid-column: span 12; }
+      .col-6 { grid-column: span 6; }
+      .col-4 { grid-column: span 4; }
+      .col-3 { grid-column: span 3; }
+      @media (max-width: 900px){ .col-6, .col-4, .col-3 { grid-column: span 12; } }
+      label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+      input, select, textarea { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: #0a0f1e; color: #e5e7eb; outline: none; }
+      input::placeholder, textarea::placeholder { color: #64748b; }
+      textarea { min-height: 80px; resize: vertical; }
+      button { background: var(--accent); color: white; border: 0; padding: 10px 14px; border-radius: 8px; cursor: pointer; transition: transform .06s ease; }
+      button:hover { transform: translateY(-1px); }
+      button.secondary { background: var(--accent-2); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .pill { display: inline-block; background: var(--pill-bg); border: 1px solid var(--border); padding: 6px 8px; border-radius: 999px; font-size: 12px; color: #93c5fd; }
+      .columns { display: grid; grid-template-columns: 1fr; gap: 16px; }
+      @media (min-width: 900px) { .columns { grid-template-columns: minmax(0,1fr) minmax(0,1fr); } }
+      .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+      .card-header h3 { margin: 0; font-size: 14px; color: #cbd5e1; }
+      .code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; background: #0b0f1d; border: 1px solid var(--border); padding: 12px; border-radius: 8px; max-height: 50vh; overflow: auto; width: 100%; }
+      .token-key { color: var(--json-key); }
+      .token-string { color: var(--json-str); }
+      .token-number { color: var(--json-num); }
+      .token-boolean { color: var(--json-bool); }
+      .token-null { color: var(--json-null); }
+      .divider { height: 1px; background: var(--border); margin: 8px 0; }
+    </style>
+    <script src="/socket.io/socket.io.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>AI Agent WebSocket Playground <span id="status" class="pill">disconnected</span></h1>
+    </header>
+    <div class="container">
+      <div class="card">
+        <div class="row">
+          <div class="col-6">
+            <label>Server URL</label>
+            <input id="host" placeholder="http://localhost:3000" value="http://localhost:3000" />
+          </div>
+          <div class="col-6">
+            <label>JWT (raw token)</label>
+            <input id="token" placeholder="eyJhbGciOi..." />
+          </div>
+
+          <div class="col-4">
+            <label>User ID</label>
+            <input id="userId" placeholder="user id from token" />
+          </div>
+          <div class="col-4">
+            <label>Session ID</label>
+            <input id="sessionId" placeholder="session-uuid" />
+          </div>
+          <div class="col-4">
+            <label>New Session Title</label>
+            <input id="title" placeholder="Chat Session" />
+          </div>
+
+          <div class="col-6">
+            <label>Optional DB URL</label>
+            <input id="dbUrl" placeholder="mongodb://localhost:27017/your_db or postgresql://... or mysql://..." />
+          </div>
+          <div class="col-3">
+            <label>DB Type (optional)</label>
+            <select id="dbType">
+              <option value="">auto-detect</option>
+              <option value="mongodb">mongodb</option>
+              <option value="postgres">postgres</option>
+              <option value="mysql">mysql</option>
+            </select>
+          </div>
+          <div class="col-3 actions">
+            <button id="btnConnect">Connect</button>
+            <button id="btnDisconnect" class="secondary">Disconnect</button>
+          </div>
+
+          <div class="col-12">
+            <label>Message</label>
+            <textarea id="message" placeholder="Ask: Update price to 69.99 where sku is RMD-001"></textarea>
+          </div>
+          <div class="col-12 actions">
+            <label style="display:flex;align-items:center;gap:8px;color:#9ca3af;font-size:12px"><input type="checkbox" id="dryRun" /> Dry run (preview only)</label>
+            <label style="display:flex;align-items:center;gap:8px;color:#9ca3af;font-size:12px"><input type="checkbox" id="refreshSchema" /> Refresh schema</label>
+            <label style="display:flex;align-items:center;gap:8px;color:#9ca3af;font-size:12px"><input type="checkbox" id="insight" checked /> Insight (verbose response)</label>
+            <button id="btnLogin" class="secondary">Login</button>
+            <button id="btnAuto" class="secondary">Auto Fill IDs</button>
+            <button id="btnJoin">Join Session</button>
+            <button id="btnSend">Send Message</button>
+            <button id="btnTyping" class="secondary">Typing</button>
+            <button id="btnGetSessions" class="secondary">Get Sessions</button>
+            <button id="btnCreateSession" class="secondary">Create Session</button>
+            <button id="btnDeleteSession" class="secondary">Delete Session</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div class="col-12">
+            <div class="card-header"><h3>HTTP AI Agent Request</h3><div class="actions"><button id="btnHttpSend">Send HTTP</button><button id="btnCopyReq" class="secondary">Copy</button></div></div>
+            <textarea id="httpBody" class="code" style="min-height:140px;">{
+  "query": "Top 5 products by revenue last 30 days",
+  "dbUrl": "postgres://user:pass@localhost:5432/mydb",
+  "dbType": "postgres",
+  "dryRun": false,
+  "refreshSchema": false,
+  "insight": true
+}</textarea>
+            <div class="divider"></div>
+            <div class="card-header"><h3>HTTP Response</h3><div class="actions"><button id="btnClearHttp" class="secondary">Clear</button></div></div>
+            <pre id="httpResp" class="code"></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="columns">
+        <div class="card">
+          <div class="card-header">
+            <h3>Events</h3>
+            <div class="actions"><button id="btnClearEvents" class="secondary">Clear</button></div>
+          </div>
+          <pre id="eventsLog" class="code"></pre>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h3>Agent Responses (data)</h3>
+            <div class="actions"><button id="btnClearResp" class="secondary">Clear</button></div>
+          </div>
+          <pre id="responseLog" class="code"></pre>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h3>Plan & Trace</h3>
+            <div class="actions"><button id="btnClearPlan" class="secondary">Clear</button></div>
+          </div>
+          <pre id="planLog" class="code"></pre>
+        </div>
+      </div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+  </html>
+
+

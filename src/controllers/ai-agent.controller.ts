@@ -9,7 +9,7 @@ export class AIAgentController {
 
   public processQuery = async (req: RequestWithUser, res: Response, next: NextFunction) => {
     try {
-      const { query, dbUrl, dbType }: AIQueryRequest = req.body;
+      const { query, dbUrl, dbType, refreshSchema, insight }: AIQueryRequest = req.body;
       const userId = req.user?._id || 'anonymous';
 
       if (!query || typeof query !== 'string' || query.trim().length === 0) {
@@ -24,9 +24,18 @@ export class AIAgentController {
         });
       }
 
-      const result = await this.aiAgent.processQuery(query.trim(), userId.toString(), { dbUrl: dbUrl.trim(), dbType });
+      const result = await this.aiAgent.processQuery(query.trim(), userId.toString(), { dbUrl: dbUrl.trim(), dbType, refreshSchema, insight });
 
-      res.status(200).json(result);
+      if (insight === true) {
+        return res.status(200).json(result);
+      }
+
+      // Minimal response when insight is false/omitted
+      return res.status(200).json({
+        data: result.data,
+        message: result.message,
+        success: true,
+      });
     } catch (error) {
       next(error);
     }
@@ -49,12 +58,13 @@ export class AIAgentController {
     try {
       res.status(200).json({
         status: 'active',
-        message: 'AI Agent is running with dynamic schema detection, user memory, and multi-database support',
-        supportedOperations: ['find', 'findOne', 'count', 'aggregate', 'sql'],
+        message: 'AI Agent is running with dynamic schema detection, user memory, multi-database, and safe CRUD support',
+        supportedOperations: ['find', 'findOne', 'count', 'aggregate', 'insertOne', 'updateOne', 'deleteOne', 'sql'],
         features: [
           'Dynamic schema detection',
           'Multi-database support (MongoDB, PostgreSQL, MySQL)',
           'Connection pooling',
+          'Safe CRUD with strict guardrails',
           'User-specific memory',
           'Query optimization based on history',
           'Personalized suggestions',
@@ -108,6 +118,32 @@ export class AIAgentController {
       res.status(200).json({
         message: 'Schema cache refreshed successfully',
       });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public profileDatabase = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { dbUrl, dbType } = req.body as any;
+      if (!dbUrl || typeof dbUrl !== 'string' || dbUrl.trim().length === 0) {
+        return res.status(400).json({ message: 'dbUrl is required and must be a non-empty string' });
+      }
+      const profile = await this.aiAgent.profileDatabase(dbUrl.trim(), dbType);
+      return res.status(200).json(profile);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public checkConnection = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { dbUrl, dbType } = req.body as any;
+      if (!dbUrl || typeof dbUrl !== 'string' || dbUrl.trim().length === 0) {
+        return res.status(400).json({ message: 'dbUrl is required and must be a non-empty string' });
+      }
+      const status = await this.aiAgent.testConnection(dbUrl.trim(), dbType);
+      return res.status(200).json(status);
     } catch (error) {
       next(error);
     }

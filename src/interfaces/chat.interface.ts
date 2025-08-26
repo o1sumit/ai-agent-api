@@ -40,6 +40,9 @@ export interface AgentResponse {
   executionTime?: number;
   confidence?: number;
   followUpQuestions?: string[];
+  plan?: any;
+  trace?: Array<{ stepIndex: number; type: string; output: any }>;
+  executedQueries?: Array<{ operation: string; queryString: string; sql?: string; collection?: string; filter?: any }>;
 }
 
 export interface DatabaseTool {
@@ -53,14 +56,19 @@ export interface DatabaseTool {
 }
 
 export interface AgentState {
-  messages: ChatMessage[];
+  messages: any[];
   currentQuery?: string;
   context: {
     userId: string;
     sessionId: string;
+    dbUrl?: string;
+    dbType?: 'mongodb' | 'postgres' | 'mysql';
     databaseSchema?: any;
     userMemory?: any;
     conversationHistory?: ChatMessage[];
+    queryAnalysis?: string;
+    executionPlan?: string;
+    toolResults?: any[];
   };
   tools: DatabaseTool[];
   thinking?: string;
@@ -70,7 +78,8 @@ export interface AgentState {
 export interface WebSocketEvents {
   // Client to Server
   'join-session': { sessionId: string; userId: string };
-  'send-message': { message: string; sessionId: string };
+  // Optional dry-run to preview plan and queries without executing
+  'send-message': { message: string; sessionId: string; dbUrl?: string; dbType?: 'mongodb' | 'postgres' | 'mysql'; dryRun?: boolean };
   typing: { sessionId: string; isTyping: boolean };
   'get-sessions': { userId: string };
   'create-session': { userId: string; title?: string };

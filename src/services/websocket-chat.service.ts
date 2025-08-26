@@ -6,6 +6,8 @@ import jwt from 'jsonwebtoken';
 import { SECRET_KEY } from '@config';
 import { ChatMessageModel, ChatSessionModel } from '@models/chat.model';
 import { DatabaseAgentService } from './database-agent.service';
+import { AIAgentService } from './ai-agent.service';
+import { Container } from 'typedi';
 import { AIMemoryService } from './ai-memory.service';
 import { ChatMessage, ChatSession, WebSocketEvents, ChatServiceConfig } from '@interfaces/chat.interface';
 import { logger } from '@utils/logger';
@@ -58,7 +60,8 @@ export class WebSocketChatService {
         }
 
         const decoded = jwt.verify(token, SECRET_KEY) as any;
-        socket.userId = decoded.id;
+        // Support tokens storing user id as _id (our AuthService) or id
+        socket.userId = decoded._id || decoded.id;
         socket.user = decoded;
 
         logger.info(`WebSocket authenticated: User ${socket.userId}`);
@@ -95,7 +98,7 @@ export class WebSocketChatService {
           let session = await ChatSessionModel.findOne({ id: sessionId, userId });
 
           if (!session) {
-            session = await this.createSession(userId, 'Chat Session');
+            session = await this.createSession(userId, 'Chat Session', sessionId);
           }
 
           // Join the session room
@@ -122,40 +125,63 @@ export class WebSocketChatService {
       // Handle sending messages
       socket.on('send-message', async (data: WebSocketEvents['send-message']) => {
         try {
-          const { message, sessionId } = data;
-          const userId = socket.userId;
+          const { message, sessionId, dbUrl, dbType, dryRun } = data;
+          const userId = socket.userId || 'anonymous';
 
-          // Validate session access
-          const session = await ChatSessionModel.findOne({ id: sessionId, userId });
-          if (!session) {
-            socket.emit('error', { message: 'Session not found' });
-            return;
+          const session = (await ChatSessionModel.findOne({ id: sessionId, userId })) || (await this.createSession(userId, 'Chat Session', sessionId));
+
+          // Determine effective DB context: prefer incoming dbUrl, else session-stored
+          let effectiveDbUrl = dbUrl;
+          let effectiveDbType = dbType;
+          if (!effectiveDbUrl && session?.context?.databaseContext && session.context.databaseContext.length > 0) {
+            const stored = JSON.parse(String(session.context.databaseContext[0]));
+            if (stored?.dbUrl) effectiveDbUrl = stored.dbUrl;
+            if (!effectiveDbType && stored?.dbType) effectiveDbType = stored.dbType as any;
           }
 
-          // Create user message
-          const userMessage = await this.createMessage({
-            userId,
-            sessionId,
-            message,
-            type: 'user',
-          });
-
-          // Broadcast user message to session
-          this.io.to(sessionId).emit('message-received', userMessage);
-
-          // Show thinking indicator
-          if (this.config.enableThinkingProcess) {
-            this.io.to(sessionId).emit('agent-thinking', {
-              message: 'Analyzing your request...',
-              sessionId,
-            });
+          // If user provided a new dbUrl, update the session context immediately
+          if (dbUrl) {
+            try {
+              if (!session.context) session.context = {} as any;
+              const packed = JSON.stringify({ dbUrl, dbType: effectiveDbType });
+              session.context.databaseContext = [packed];
+              await (session as any).save?.();
+            } catch (_) {}
           }
 
-          // Get conversation history
-          const conversationHistory = await ChatMessageModel.find({ sessionId }).sort({ createdAt: -1 }).limit(20).lean();
+          // Process message
+          let agentResponse;
+          if (effectiveDbUrl) {
+            // Route to AI Agent multi-DB flow using session-bound context
+            const aiAgent = Container.get(AIAgentService);
+            const result = await aiAgent.processQuery(message, userId, { dbUrl: effectiveDbUrl, dbType: effectiveDbType, dryRun });
+            agentResponse = {
+              message: result.message || (typeof result?.data === 'object' ? JSON.stringify(result.data) : String(result?.data ?? '')),
+              type: dryRun ? 'text' : 'data',
+              data: result.data,
+              toolsUsed: ['ai-agent'],
+              executionTime: result.executionTime,
+              confidence: 0.8,
+              plan: result.plan,
+              trace: result.trace,
+              executedQueries: result.executedQueries,
+            } as any;
 
-          // Process message with database agent
-          const agentResponse = await this.databaseAgent.processMessage(message, userId, sessionId, conversationHistory.reverse());
+            // Persist db context for future messages in this session
+            try {
+              if (!session.context) session.context = {} as any;
+              const packed = JSON.stringify({ dbUrl: effectiveDbUrl, dbType: effectiveDbType });
+              session.context.databaseContext = [packed];
+              await (session as any).save?.();
+            } catch (_) {
+              // ignore
+            }
+          } else {
+            // Fallback to LangGraph-based workflow with enriched context
+            const conversationHistory = await ChatMessageModel.find({ sessionId }).sort({ createdAt: -1 }).limit(20).lean();
+            const enrichedHistory = conversationHistory.reverse();
+            agentResponse = await this.databaseAgent.processMessage(message, userId, sessionId, enrichedHistory);
+          }
 
           // Create agent message
           const agentMessage = await this.createMessage({
@@ -173,37 +199,14 @@ export class WebSocketChatService {
           });
 
           // Update session
-          session.messageCount += 2; // user + agent message
+          session.messageCount += 2;
           session.lastActivity = new Date();
+          await (session as any).save?.();
 
-          // Update context
-          if (!session.context) session.context = {};
-          session.context.recentQueries = [message, ...(session.context.recentQueries || []).slice(0, 4)];
-
-          await session.save();
-
-          // Record in memory system
-          await this.memoryService.recordQuery(
-            userId,
-            message,
-            agentResponse.message,
-            'find', // This would be determined by the agent
-            ['chat'],
-            agentResponse.executionTime || 0,
-            agentResponse.data ? (Array.isArray(agentResponse.data) ? agentResponse.data.length : 1) : 0,
-            agentResponse.type !== 'error',
-          );
-
-          // Send agent response
-          this.io.to(sessionId).emit('message-received', agentMessage);
-          this.io.to(sessionId).emit('agent-response', {
-            response: agentResponse,
-            sessionId,
-          });
-
-          logger.info(`Message processed for session ${sessionId}`);
+          // Emit agent message back
+          this.io.to(socket.id).emit('message', agentMessage);
         } catch (error) {
-          logger.error(`Error processing message: ${error.message}`);
+          logger.error(`send-message error: ${(error as any)?.message}`);
           socket.emit('error', { message: 'Failed to process message' });
         }
       });
@@ -317,9 +320,9 @@ export class WebSocketChatService {
     return message.toObject();
   }
 
-  private async createSession(userId: string, title?: string): Promise<ChatSession & Document & { _id: any }> {
+  private async createSession(userId: string, title?: string, id?: string): Promise<ChatSession & Document & { _id: any }> {
     const sessionData = {
-      id: uuidv4(),
+      id: id || uuidv4(),
       userId,
       title: title || `Chat ${new Date().toLocaleString()}`,
       isActive: true,

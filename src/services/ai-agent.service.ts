@@ -1,8 +1,8 @@
 import { Service } from 'typedi';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
-import { GOOGLE_API_KEY } from '@config';
-import { HttpException } from '@exceptions/httpException';
+import { GOOGLE_API_KEY, GOOGLE_MODEL, DEFAULT_ROW_LIMIT, QUERY_TIMEOUT_MS, REDACT_SQL_IN_RESPONSES } from '@config';
+import { HttpException } from '@exceptions/HttpException';
 import { SchemaDetectorService } from './schema-detector.service';
 import { SQLSchemaDetectorService } from './sql-schema-detector.service';
 import { DbPoolService } from './db-pool.service';
@@ -10,10 +10,40 @@ import { AIMemoryService } from './ai-memory.service';
 import { QueryResult, MongoQueryObject, SQLQueryObject, DBType } from '@interfaces/ai-agent.interface';
 import { logger } from '@utils/logger';
 import mongoose from 'mongoose';
+import { SchemaRegistryService } from './schema-registry.service';
+import { SqlInsightService } from './sql-insight.service';
+import { DataProfilerService } from './data-profiler.service';
+import { SchemaKeywordMatcherService } from './schema-keyword-matcher.service';
+import { Container } from 'typedi';
+
+type PlanStep =
+  | {
+      type: 'db_query';
+      description?: string;
+      subQuery: string;
+    }
+  | {
+      type: 'compute_statistics';
+      description?: string;
+      onStep: number; // index of previous step to analyze
+      operations?: string[]; // e.g., ["count", "topk:field:5", "mean:price"]
+    }
+  | {
+      type: 'llm_analysis';
+      description?: string;
+      onSteps: number[]; // indices of steps to analyze
+      instructions?: string;
+    };
+
+interface ExecutionPlan {
+  steps: PlanStep[];
+}
 
 interface DBConnectionOptions {
   dbUrl: string;
   dbType?: DBType;
+  refreshSchema?: boolean;
+  insight?: boolean;
 }
 
 @Service()
@@ -23,25 +53,34 @@ export class AIAgentService {
   private sqlSchemaDetector: SQLSchemaDetectorService;
   private dbPool: DbPoolService;
   private memoryService: AIMemoryService;
+  private schemaRegistry: SchemaRegistryService;
+  private sqlInsight: SqlInsightService;
+  private profiler: DataProfilerService;
+  private schemaMatcher: SchemaKeywordMatcherService;
 
   constructor() {
+    // LLM is optional; when missing we'll use heuristic fallbacks
     if (!GOOGLE_API_KEY) {
-      throw new HttpException(500, 'Google API key is not configured');
+      logger.warn('GOOGLE_API_KEY not set. Falling back to heuristic planning/generation without LLM.');
+    } else {
+      this.llm = new ChatGoogleGenerativeAI({
+        apiKey: GOOGLE_API_KEY,
+        model: GOOGLE_MODEL,
+        temperature: 0.1,
+      });
     }
-
-    this.llm = new ChatGoogleGenerativeAI({
-      apiKey: GOOGLE_API_KEY,
-      model: 'gemini-1.5-flash',
-      temperature: 0.1,
-    });
 
     this.schemaDetector = new SchemaDetectorService();
     this.sqlSchemaDetector = new SQLSchemaDetectorService();
-    this.dbPool = new DbPoolService();
+    this.dbPool = Container.get(DbPoolService);
     this.memoryService = new AIMemoryService();
+    this.schemaRegistry = new SchemaRegistryService();
+    this.sqlInsight = new SqlInsightService();
+    this.profiler = new DataProfilerService();
+    this.schemaMatcher = new SchemaKeywordMatcherService();
   }
 
-  public async processQuery(userQuery: string, userId: string, dbOptions: DBConnectionOptions): Promise<QueryResult> {
+  public async processQuery(userQuery: string, userId: string, dbOptions: DBConnectionOptions & { dryRun?: boolean }): Promise<QueryResult> {
     const startTime = Date.now();
 
     try {
@@ -50,48 +89,330 @@ export class AIAgentService {
       // Get database connection
       const dbConnection = await this.dbPool.get(dbOptions.dbUrl, dbOptions.dbType);
 
-      // Get memory insights for the user
-      const memoryInsights = await this.memoryService.getMemoryInsights(userId, userQuery);
+      // Derive db identity for per-db memory and context
+      const { dbKey } = this.schemaRegistry.getDbIdentity(dbOptions.dbUrl, dbConnection.type);
 
-      // Get dynamic database schema
-      let schemaInfo: string;
-      if (dbConnection.type === 'mongodb') {
-        const schemas = await this.schemaDetector.getAllSchemas(dbConnection.mongo);
-        schemaInfo = this.schemaDetector.getSchemaAsString(schemas);
-      } else {
-        schemaInfo = await this.sqlSchemaDetector.getSchemaAsString(
-          dbConnection.type,
-          dbConnection.type === 'postgres' ? dbConnection.pg : dbConnection.mysql
-        );
+      // Get memory insights for the user scoped to this dbKey
+      const memoryInsights = await this.memoryService.getMemoryInsights(userId, userQuery, dbKey);
+
+      // Early exit for greetings/small talk without hitting the database
+      if (this.isGreeting(userQuery)) {
+        const executionTime = Date.now() - startTime;
+        const politeMessage = await this.composeGeneralResponse(userQuery, memoryInsights);
+
+        try {
+          await this.memoryService.recordQuery(
+            userId,
+            dbKey,
+            userQuery,
+            'Conversation detected: no database query executed',
+            'find',
+            ['n/a'],
+            executionTime,
+            0,
+            true,
+          );
+        } catch (memErr: any) {
+          logger.warn(`Memory record (conversation) failed: ${memErr.message}`);
+        }
+
+        return {
+          data: null,
+          message: politeMessage,
+          query: undefined,
+          suggestions: memoryInsights.suggestions,
+          executionTime,
+          memoryInsights: {
+            similarQueries: memoryInsights.similarQueries.length,
+            userLevel: memoryInsights.userPreferences?.learningProfile?.skillLevel || 'beginner',
+            queryPattern: memoryInsights.queryPattern,
+          },
+        };
       }
 
-      // Generate query using AI with memory context
-      const queryObject = await this.generateQuery(userQuery, schemaInfo, memoryInsights, dbConnection.type);
+      // Schema exploration shortcuts (no LLM needed): "show tables", "list tables", "show schema", "describe schema"
+      if (/^(show|list)\s+(tables|schema|schemas)$/i.test(userQuery) || /(show|list)\s+(tables|schema|schemas)/i.test(userQuery)) {
+        const schemaString = await this.schemaRegistry.getOrBuildSchemaString(
+          dbOptions.dbUrl,
+          dbConnection.type,
+          dbConnection,
+          !!dbOptions.refreshSchema,
+        );
+        const parsed = (() => {
+          try {
+            return JSON.parse(schemaString);
+          } catch {
+            return [];
+          }
+        })();
+        const tablesOrCollections = Array.isArray(parsed) ? parsed.map((t: any) => t.table || t.collection || '').filter(Boolean) : [];
+        const executionTime = Date.now() - startTime;
+        return {
+          data: tablesOrCollections,
+          message: `Found ${tablesOrCollections.length} ${dbConnection.type === 'mongodb' ? 'collections' : 'tables'}`,
+          query: 'Schema exploration',
+          suggestions: [],
+          executionTime,
+          executedQueries: [],
+          plan: { steps: [] },
+          trace: [],
+          memoryInsights: { similarQueries: 0, userLevel: 'beginner', queryPattern: 'schema' },
+        } as any;
+      }
 
-      // Execute the generated query
-      const result = await this.executeQuery(queryObject, dbConnection);
+      // Relationship/foreign-key exploration shortcuts
+      if (/(show|list|describe)\s+(relations|relationships|foreign\s*keys|fks|references)/i.test(userQuery)) {
+        const schemaString = await this.schemaRegistry.getOrBuildSchemaString(
+          dbOptions.dbUrl,
+          dbConnection.type,
+          dbConnection,
+          !!dbOptions.refreshSchema,
+        );
+        const parsed = (() => {
+          try {
+            return JSON.parse(schemaString);
+          } catch {
+            return [];
+          }
+        })();
+        const relations: Array<{ fromTable: string; fromColumn: string; toTable: string; toColumn: string }> = [];
+        if (Array.isArray(parsed)) {
+          for (const t of parsed) {
+            const tableName = t.table || t.collection;
+            if (t?.foreign_keys && Array.isArray(t.foreign_keys)) {
+              for (const fk of t.foreign_keys) {
+                relations.push({ fromTable: tableName, fromColumn: fk.column_name, toTable: fk.references_table, toColumn: fk.references_column });
+              }
+            }
+            if (!t?.foreign_keys && t?.relationships && Array.isArray(t.relationships)) {
+              for (const rel of t.relationships) {
+                if (rel?.collection || rel?.references_collection) {
+                  relations.push({
+                    fromTable: tableName,
+                    fromColumn: rel.localField || rel.local_field || 'unknown',
+                    toTable: rel.collection || rel.references_collection,
+                    toColumn: rel.foreignField || rel.foreign_field || 'unknown',
+                  });
+                }
+              }
+            }
+          }
+        }
+        const executionTime = Date.now() - startTime;
+        return {
+          data: relations,
+          message: `Found ${relations.length} relationship(s)`,
+          query: 'Relationship exploration',
+          suggestions: [],
+          executionTime,
+          executedQueries: [],
+          plan: { steps: [] },
+          trace: [],
+          memoryInsights: { similarQueries: 0, userLevel: 'beginner', queryPattern: 'relationships' },
+        } as any;
+      }
 
-      const executionTime = Date.now() - startTime;
-      const resultCount = Array.isArray(result) ? result.length : result ? 1 : 0;
+      // Describe columns of a specific table/collection
+      const describeMatch =
+        userQuery.match(/(?:show|list|describe)\s+(?:columns?|structure|schema|fields?)\s+(?:for|of|in)?\s*([a-zA-Z0-9_\.]+)/i) ||
+        userQuery.match(/^describe\s+([a-zA-Z0-9_\.]+)/i);
+      if (describeMatch && describeMatch[1]) {
+        const targetRaw = describeMatch[1].toLowerCase();
+        const schemaString = await this.schemaRegistry.getOrBuildSchemaString(
+          dbOptions.dbUrl,
+          dbConnection.type,
+          dbConnection,
+          !!dbOptions.refreshSchema,
+        );
+        const parsed = (() => {
+          try {
+            return JSON.parse(schemaString);
+          } catch {
+            return [];
+          }
+        })();
+        let found: any = null;
+        if (Array.isArray(parsed)) {
+          // Find best matching table/collection
+          const candidates = parsed.filter((t: any) => {
+            const name = String(t.table || t.collection || '').toLowerCase();
+            const short = name.includes('.') ? name.split('.').pop() : name;
+            return name === targetRaw || short === targetRaw || name.endsWith(`.${targetRaw}`) || short.includes(targetRaw);
+          });
+          found = candidates[0];
+        }
+        const columns = (found?.columns || []).map((c: any) => ({
+          column_name: c.column_name || c.name || c.field,
+          data_type: c.data_type || c.type || 'unknown',
+          is_nullable: c.is_nullable ?? 'unknown',
+          is_primary: Array.isArray(found?.primary_key) ? found.primary_key.includes(c.column_name) : false,
+        }));
+        const executionTime = Date.now() - startTime;
+        return {
+          data: columns,
+          message: found ? `Columns for ${found.table || found.collection}` : 'No matching table/collection found',
+          query: 'Columns exploration',
+          suggestions: [],
+          executionTime,
+          executedQueries: [],
+          plan: { steps: [] },
+          trace: [],
+          memoryInsights: { similarQueries: 0, userLevel: 'beginner', queryPattern: 'columns' },
+        } as any;
+      }
 
-      // Record this query in memory
-      await this.memoryService.recordQuery(
-        userId,
-        userQuery,
-        queryObject.queryString,
-        queryObject.operation as any,
-        dbConnection.type === 'mongodb' ? [(queryObject as MongoQueryObject).collection || 'unknown'] : ['sql_table'],
-        executionTime,
-        resultCount,
-        true,
+      // Get database schema from persistent registry (build if missing/stale)
+      const schemaInfo = await this.schemaRegistry.getOrBuildSchemaString(
+        dbOptions.dbUrl,
+        dbConnection.type,
+        dbConnection,
+        dbOptions.refreshSchema === true,
       );
 
+      // Build quick capability summary to guide planning
+      let capabilitySummary = '';
+      try {
+        capabilitySummary = await this.profiler.getCapabilitiesSummary(dbConnection);
+      } catch (e: any) {
+        logger.warn(`Profiling failed: ${e.message}`);
+      }
+
+      // Lightweight keyword-to-schema candidates leveraging parsed schema for any DB
+      let schemaHints: any = null;
+      try {
+        schemaHints = await this.schemaMatcher.match(userQuery, { schemaJson: schemaInfo, dbType: dbConnection.type, dbConnection });
+      } catch (e: any) {
+        logger.warn(`Schema keyword match failed: ${e.message}`);
+      }
+
+      // Plan → Execute workflow
+      let plan: ExecutionPlan | null = null;
+      let finalData: any = null;
+      let executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }> = [];
+      let toolOutputs: Array<{ stepIndex: number; type: string; output: any }> = [];
+
+      try {
+        // Enrich plan prompt with capability summary
+        const enrichedMemory = { ...memoryInsights, capabilitySummary, schemaHints } as any;
+        plan = await this.planExecution(userQuery, schemaInfo, enrichedMemory, dbConnection.type);
+        if (dbOptions.dryRun) {
+          // Only preview: synthesize executedQueries list by generating queries without executing
+          for (let i = 0; i < plan.steps.length; i++) {
+            const step = plan.steps[i] as PlanStep;
+            if (step.type === 'db_query') {
+              const subQuery = (step as any).subQuery || userQuery;
+              const queryObject = await this.generateQuery(subQuery, schemaInfo, memoryInsights, dbConnection.type);
+              executedQueries.push({ queryObject, result: null });
+            }
+          }
+        } else {
+          // Heuristic: if the user asks for top/most selling product and DB is SQL, attempt an insight-first query
+          if (dbConnection.type !== 'mongodb' && /most\s+selling|top\s+selling|best\s+selling/i.test(userQuery)) {
+            try {
+              const sql = await this.sqlInsight.getTopSellingSQL(
+                dbConnection.type,
+                dbConnection.type === 'postgres' ? dbConnection.pg : dbConnection.mysql,
+              );
+              if (sql) {
+                const quickQuery: SQLQueryObject = { operation: 'sql', queryString: 'Top selling products', sql };
+                const result = await this.executeQuery(quickQuery, dbConnection);
+                finalData = result;
+                executedQueries.push({ queryObject: quickQuery, result });
+              }
+            } catch (e: any) {
+              logger.warn(`Insight query failed, falling back to plan: ${e.message}`);
+            }
+          }
+
+          // If no insight data fetched, run the planned execution
+          const execution =
+            finalData == null
+              ? await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery)
+              : ({ finalData, executedQueries, toolOutputs } as any);
+          finalData = execution.finalData;
+          executedQueries = execution.executedQueries;
+          toolOutputs = execution.toolOutputs;
+        }
+      } catch (planError: any) {
+        logger.warn(`Plan-execute flow failed, falling back to single-shot: ${planError.message}`);
+        // Fallback to single-shot query generation
+        let queryObject: MongoQueryObject | SQLQueryObject | null = null;
+        try {
+          queryObject = await this.generateQuery(userQuery, schemaInfo, { ...memoryInsights, capabilitySummary, schemaHints }, dbConnection.type);
+        } catch (e: any) {
+          // Heuristic fallback if LLM JSON failed
+          logger.warn(`Single-shot generation failed, using heuristic fallback: ${e.message}`);
+          queryObject = await this.generateHeuristicQuery(userQuery, schemaInfo, dbConnection.type);
+        }
+        if (dbOptions.dryRun) {
+          executedQueries = [{ queryObject, result: null }];
+        } else {
+          const result = await this.executeQuery(queryObject, dbConnection);
+          finalData = result;
+          executedQueries = [{ queryObject, result }];
+        }
+      }
+
+      const executionTime = Date.now() - startTime;
+      const resultCount = Array.isArray(finalData) ? finalData.length : finalData ? 1 : 0;
+
+      // Record this query in memory
+      try {
+        if (executedQueries.length > 0) {
+          const first = executedQueries[0].queryObject;
+          await this.memoryService.recordQuery(
+            userId,
+            dbKey,
+            userQuery,
+            first.queryString,
+            (first as any).operation,
+            dbConnection.type === 'mongodb' ? [(first as MongoQueryObject).collection || 'unknown'] : ['sql_table'],
+            executionTime,
+            resultCount,
+            true,
+          );
+        } else {
+          await this.memoryService.recordQuery(
+            userId,
+            dbKey,
+            userQuery,
+            'Plan executed without direct DB query',
+            'find',
+            ['n/a'],
+            executionTime,
+            resultCount,
+            true,
+          );
+        }
+      } catch (memErr: any) {
+        logger.warn(`Memory record failed: ${memErr.message}`);
+      }
+
+      // Generate final response message using LLM if available; otherwise default
+      let finalMessage = dbOptions.dryRun ? 'Preview generated successfully' : `Retrieved ${resultCount} record(s)`;
+      if (this.llm) {
+        try {
+          finalMessage = await this.generateFinalResponseMessage(userQuery, executedQueries, toolOutputs, memoryInsights);
+        } catch (composeErr: any) {
+          logger.warn(`Failed to compose final response, using default message: ${composeErr.message}`);
+        }
+      }
+
       return {
-        data: result,
-        message: 'Query executed successfully',
-        query: queryObject.queryString,
+        data: finalData,
+        message: finalMessage,
+        query: executedQueries[0]?.queryObject?.queryString,
         suggestions: memoryInsights.suggestions,
         executionTime,
+        plan,
+        trace: toolOutputs,
+        executedQueries: executedQueries.map(eq => {
+          const base: any = { operation: (eq.queryObject as any).operation, queryString: (eq.queryObject as any).queryString };
+          if ((eq.queryObject as any).sql) base.sql = REDACT_SQL_IN_RESPONSES ? '[redacted]' : (eq.queryObject as any).sql;
+          if ((eq.queryObject as any).collection) base.collection = (eq.queryObject as any).collection;
+          if ((eq.queryObject as any).filter) base.filter = (eq.queryObject as any).filter;
+          return base;
+        }),
         memoryInsights: {
           similarQueries: memoryInsights.similarQueries.length,
           userLevel: memoryInsights.userPreferences?.learningProfile?.skillLevel || 'beginner',
@@ -103,7 +424,8 @@ export class AIAgentService {
 
       // Record failed query
       try {
-        await this.memoryService.recordQuery(userId, userQuery, 'FAILED', 'find', ['unknown'], executionTime, 0, false);
+        const { dbKey } = this.schemaRegistry.getDbIdentity(dbOptions.dbUrl, dbOptions.dbType as DBType);
+        await this.memoryService.recordQuery(userId, dbKey, userQuery, 'FAILED', 'find', ['unknown'], executionTime, 0, false);
       } catch (memoryError: any) {
         logger.error(`Failed to record failed query: ${memoryError.message}`);
       }
@@ -113,7 +435,279 @@ export class AIAgentService {
     }
   }
 
-  private async generateQuery(userQuery: string, schemaInfo: string, memoryInsights: any, dbType: DBType): Promise<MongoQueryObject | SQLQueryObject> {
+  private isGreeting(input: string): boolean {
+    const text = (input || '').trim().toLowerCase();
+    if (!text) return false;
+    const patterns = [
+      /^(hi|hello|hey|yo|sup)[!,. ]*$/,
+      /^(good\s*(morning|afternoon|evening))\b/,
+      /^(how\s*are\s*you)\b/,
+      /^thanks?\b/,
+      /^thank\s*you\b/,
+      /^what'?s\s*up\b/,
+    ];
+    return patterns.some(rx => rx.test(text));
+  }
+
+  private async composeGeneralResponse(userQuery: string, memoryInsights: any): Promise<string> {
+    const prompt = `You are a mature, helpful assistant. The user message appears to be greeting or small talk.
+
+User: "${userQuery}"
+User preferences: ${JSON.stringify(memoryInsights?.userPreferences || {}, null, 2)}
+
+Respond briefly and warmly, offer help, and mention you can:
+- answer questions
+- query connected databases (when provided)
+- perform light data analysis and recommendations.
+Do not include raw data or technical details. Keep it to 1-2 short sentences.`;
+    const res = await this.llm.invoke([new SystemMessage(prompt), new HumanMessage('Please reply with 1-2 short sentences only.')]);
+    return res.content.toString();
+  }
+
+  // Create a multi-step execution plan in JSON
+  private async planExecution(userQuery: string, schemaInfo: string, memoryInsights: any, dbType: DBType): Promise<ExecutionPlan> {
+    const toolsDescription = `Available Tools:
+1) db_query: Generate and execute a single ${dbType.toUpperCase()} or MongoDB query for a sub-goal. Input: { "subQuery": string }
+2) compute_statistics: Compute quick stats on prior step results (arrays of objects). Input: { "onStep": number, "operations"?: string[] }
+3) llm_analysis: Use the LLM to analyze results and produce insights or recommendations. Input: { "onSteps": number[], "instructions"?: string }`;
+
+    const planningPrompt = `You are a senior data agent. Create a concise step-by-step plan to fulfill the user's request by selecting from the available tools.
+
+User Query:\n"${userQuery}"
+
+Database Schema:\n${schemaInfo}
+
+User Context:\n${JSON.stringify(memoryInsights || {}, null, 2)}
+
+Important Notes About Database Schema JSON:
+- SQL schemas include keys: table (e.g. schema.table), columns [{ column_name, data_type, is_nullable }], primary_key [..], foreign_keys [{ column_name, references_table, references_column }].
+- Prefer joins based on foreign_keys instead of ad-hoc matching.
+- Use table names exactly as they appear in the schema JSON (keep schema prefixes where present).
+- For MongoDB, collection schemas include relationships (reference/potential_reference). Consider using $lookup when relationships are provided.
+
+${toolsDescription}
+
+Rules:
+- Prefer a single db_query step when sufficient.
+- For analysis or recommendations, first fetch relevant data (db_query), then compute_statistics if numeric/categorical summaries help, and optionally do llm_analysis to explain/advise.
+- Keep the plan minimal but sufficient.
+- Output strictly valid JSON in this schema (no markdown/code fences, no commentary; the entire reply MUST be a single JSON object):
+{
+  "steps": [
+    { "type": "db_query", "description": "...", "subQuery": "..." },
+    { "type": "compute_statistics", "onStep": 0, "operations": ["count", "topk:field:5"] },
+    { "type": "llm_analysis", "onSteps": [0,1], "instructions": "Explain insights and give recommendations" }
+  ]
+}`;
+
+    const response = await this.llm.invoke([
+      new SystemMessage(planningPrompt),
+      new HumanMessage(
+        'Return only the JSON object for the plan. Do not add backticks. If unsure, return {"steps":[{"type":"db_query","subQuery":"USER_QUERY"}]} and replace USER_QUERY with the user query.',
+      ),
+    ]);
+    let raw = response.content.toString();
+    try {
+      const extracted = this.extractFirstJson(raw);
+      let parsed = JSON.parse(extracted);
+      if (Array.isArray(parsed)) parsed = { steps: parsed };
+      if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('Invalid plan structure');
+      return parsed as ExecutionPlan;
+    } catch (e1: any) {
+      // Retry once with a stricter request
+      try {
+        const retry = await this.llm.invoke([
+          new SystemMessage(planningPrompt),
+          new HumanMessage(
+            'Return ONLY a single JSON object per the schema. No markdown. If unsure, return {"steps":[{"type":"db_query","subQuery":"USER_QUERY"}]} with the user query filled.',
+          ),
+        ]);
+        raw = retry.content.toString();
+        const extracted = this.extractFirstJson(raw);
+        let parsed = JSON.parse(extracted);
+        if (Array.isArray(parsed)) parsed = { steps: parsed };
+        if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('Invalid plan structure');
+        return parsed as ExecutionPlan;
+      } catch (e2: any) {
+        // Default minimal plan fallback to avoid noisy warnings
+        logger.info('Planning JSON not found; using minimal default plan.');
+        const minimal: ExecutionPlan = { steps: [{ type: 'db_query', description: 'Direct query', subQuery: userQuery }] } as any;
+        return minimal;
+      }
+    }
+  }
+
+  // Execute plan steps in order
+  private async executePlannedSteps(
+    plan: ExecutionPlan,
+    dbConnection: any,
+    schemaInfo: string,
+    memoryInsights: any,
+    userQuery: string,
+  ): Promise<{
+    finalData: any;
+    executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }>;
+    toolOutputs: Array<{ stepIndex: number; type: string; output: any }>;
+  }> {
+    const executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }> = [];
+    const toolOutputs: Array<{ stepIndex: number; type: string; output: any }> = [];
+    const stepResults: any[] = [];
+
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i] as PlanStep;
+      try {
+        if (step.type === 'db_query') {
+          const subQuery = (step as Extract<PlanStep, { type: 'db_query' }>).subQuery || userQuery;
+          const queryObject = await this.generateQuery(subQuery, schemaInfo, memoryInsights, dbConnection.type);
+          const result = await this.executeQuery(queryObject, dbConnection);
+          executedQueries.push({ queryObject, result });
+          stepResults[i] = result;
+          toolOutputs.push({ stepIndex: i, type: 'db_query', output: { query: queryObject.queryString, rows: this.previewArray(result) } });
+        } else if (step.type === 'compute_statistics') {
+          const onIndex = (step as Extract<PlanStep, { type: 'compute_statistics' }>).onStep;
+          const base = stepResults[onIndex];
+          const ops = (step as Extract<PlanStep, { type: 'compute_statistics' }>).operations || ['count'];
+          const stats = this.computeQuickStatistics(base, ops);
+          stepResults[i] = stats;
+          toolOutputs.push({ stepIndex: i, type: 'compute_statistics', output: stats });
+        } else if (step.type === 'llm_analysis') {
+          const onSteps = (step as Extract<PlanStep, { type: 'llm_analysis' }>).onSteps || [];
+          const instructions = (step as Extract<PlanStep, { type: 'llm_analysis' }>).instructions || 'Analyze the results and provide insights.';
+          const picked = onSteps.map(idx => stepResults[idx]);
+          const analysis = await this.performLLMAnalysis(userQuery, picked, instructions);
+          stepResults[i] = analysis;
+          toolOutputs.push({ stepIndex: i, type: 'llm_analysis', output: analysis });
+        }
+      } catch (err: any) {
+        logger.warn(`Step ${i} (${(step as any).type}) failed: ${err.message}`);
+        stepResults[i] = { error: err.message };
+        toolOutputs.push({ stepIndex: i, type: 'error', output: err.message });
+      }
+    }
+
+    // Choose final data: prefer last db_query result; else last step result
+    let finalData: any = null;
+    for (let i = plan.steps.length - 1; i >= 0; i--) {
+      if (plan.steps[i].type === 'db_query') {
+        finalData = stepResults[i];
+        break;
+      }
+    }
+    if (finalData == null && plan.steps.length > 0) {
+      finalData = stepResults[plan.steps.length - 1];
+    }
+
+    return { finalData, executedQueries, toolOutputs };
+  }
+
+  private previewArray(value: any, limit = 10): any {
+    if (Array.isArray(value)) return value.slice(0, limit);
+    return value;
+  }
+
+  private computeQuickStatistics(data: any, operations: string[]): any {
+    const result: any = {};
+    const arr = Array.isArray(data) ? data : [];
+    const columns = this.inferColumns(arr);
+
+    for (const opRaw of operations) {
+      const op = String(opRaw || '').toLowerCase();
+      if (op === 'count') {
+        result.count = arr.length;
+      } else if (op.startsWith('topk:')) {
+        const [, field, kStr] = op.split(':');
+        const k = Math.max(1, Math.min(50, parseInt(kStr || '5', 10)));
+        const freq: Record<string, number> = {};
+        for (const row of arr) {
+          const v = row?.[field];
+          if (v != null) freq[String(v)] = (freq[String(v)] || 0) + 1;
+        }
+        result[`topk_${field}`] = Object.entries(freq)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, k)
+          .map(([val, cnt]) => ({ value: val, count: cnt }));
+      } else if (op.startsWith('mean:') || op.startsWith('avg:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        const mean = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+        result[`mean_${field}`] = mean;
+      } else if (op.startsWith('min:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        result[`min_${field}`] = nums.length ? Math.min(...nums) : null;
+      } else if (op.startsWith('max:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        result[`max_${field}`] = nums.length ? Math.max(...nums) : null;
+      } else if (op.startsWith('sum:')) {
+        const field = op.split(':')[1];
+        const nums = arr.map(r => Number(r?.[field])).filter(n => Number.isFinite(n));
+        result[`sum_${field}`] = nums.length ? nums.reduce((a, b) => a + b, 0) : 0;
+      } else if (op.startsWith('distinct:')) {
+        const field = op.split(':')[1];
+        const set = new Set<string>();
+        for (const row of arr) if (row && row[field] != null) set.add(String(row[field]));
+        result[`distinct_${field}`] = Array.from(set);
+      }
+    }
+    result.columns = columns;
+    return result;
+  }
+
+  private inferColumns(rows: any[]): string[] {
+    const set = new Set<string>();
+    for (const row of rows) if (row && typeof row === 'object') for (const k of Object.keys(row)) set.add(k);
+    return Array.from(set);
+  }
+
+  private async performLLMAnalysis(userQuery: string, datasets: any[], instructions: string): Promise<string> {
+    const sample = datasets.map(ds => (Array.isArray(ds) ? ds.slice(0, 20) : ds));
+    const prompt = `User query: "${userQuery}"
+
+We have the following datasets (JSON previews, truncated to first 20 rows each):
+${sample.map((s, idx) => `Dataset ${idx}:\n${JSON.stringify(s, null, 2)}`).join('\n\n')}
+
+Instructions: ${instructions}
+
+Provide a concise analysis and, if applicable, recommendations grounded in the data. Do not include raw JSON in the final message.`;
+    const res = await this.llm.invoke([new SystemMessage(prompt), new HumanMessage('Provide a concise analysis and recommendations.')]);
+    return res.content.toString();
+  }
+
+  private async generateFinalResponseMessage(
+    userQuery: string,
+    executedQueries: Array<{ queryObject: MongoQueryObject | SQLQueryObject; result: any }>,
+    toolOutputs: Array<{ stepIndex: number; type: string; output: any }>,
+    memoryInsights: any,
+  ): Promise<string> {
+    const querySummaries = executedQueries.map((q, i) => ({
+      index: i,
+      description: q.queryObject.queryString,
+      rows: Array.isArray(q.result) ? q.result.length : q.result ? 1 : 0,
+    }));
+    const previewOutputs = toolOutputs.slice(-5); // last few tool outputs
+    const prompt = `Summarize the results for the user.
+
+User Query: "${userQuery}"
+Executed Queries: ${JSON.stringify(querySummaries)}
+Recent Tool Outputs: ${JSON.stringify(previewOutputs)}
+User Preferences: ${JSON.stringify(memoryInsights?.userPreferences || {}, null, 2)}
+
+Guidelines:
+- Be direct and clear.
+- If analysis/recommendations are available, include them briefly.
+- Avoid raw JSON; present findings in plain language.
+`;
+    const res = await this.llm.invoke([new SystemMessage(prompt), new HumanMessage('Write a short final message for the user.')]);
+    return res.content.toString();
+  }
+
+  private async generateQuery(
+    userQuery: string,
+    schemaInfo: string,
+    memoryInsights: any,
+    dbType: DBType,
+  ): Promise<MongoQueryObject | SQLQueryObject> {
     // Build context from memory
     let memoryContext = '';
     if (memoryInsights.similarQueries.length > 0) {
@@ -139,6 +733,11 @@ export class AIAgentService {
       memoryContext += `\n\nSuggestions based on user history:\n${memoryInsights.suggestions.join('\n- ')}`;
     }
 
+    // If LLM is unavailable, use heuristic generator
+    if (!this.llm) {
+      return this.generateHeuristicQuery(userQuery, schemaInfo, dbType);
+    }
+
     if (dbType === 'mongodb') {
       return this.generateMongoQuery(userQuery, schemaInfo, memoryContext);
     } else {
@@ -146,70 +745,116 @@ export class AIAgentService {
     }
   }
 
-  private async generateMongoQuery(userQuery: string, schemaInfo: string, memoryContext: string): Promise<MongoQueryObject> {
+  // Heuristic generator for when no LLM is available
+  private async generateHeuristicQuery(userQuery: string, schemaInfo: string, dbType: DBType): Promise<MongoQueryObject | SQLQueryObject> {
+    const text = (userQuery || '').toLowerCase();
+    // Extract likely collection/table keyword
+    const names: string[] = [];
+    try {
+      const parsed = JSON.parse(schemaInfo);
+      if (Array.isArray(parsed)) {
+        if (dbType === 'mongodb') {
+          for (const s of parsed) if ((s as any)?.collection) names.push(String((s as any).collection).toLowerCase());
+        } else {
+          for (const t of parsed) if ((t as any)?.table) names.push(String((t as any).table).toLowerCase());
+        }
+      }
+    } catch {}
 
-    const systemPrompt = `You are an advanced MongoDB query generator with user context awareness. Generate optimized MongoDB queries based on the user's natural language input, database schema, and their query history.
+    const pickName = (): string | undefined => {
+      const tokens = text.split(/[^a-z0-9_.]+/g).filter(Boolean);
+      const scored = names.map(n => ({ n, score: tokens.some(t => n.includes(t)) ? n.length : 0 })).sort((a, b) => b.score - a.score);
+      return scored[0]?.score ? scored[0].n : undefined;
+    };
+
+    const wantCount = /\bcount|how many\b/.test(text);
+    const wantLatest = /\b(latest|recent|newest)\b/.test(text);
+    const wantLimit = /\btop|first\b/.test(text);
+
+    if (dbType === 'mongodb') {
+      const collection = (pickName() || 'users').replace(/^.*\./, '');
+      if (wantCount) return { operation: 'count', queryString: 'Count documents', collection } as any;
+      const filter: any = {};
+      const sort = wantLatest ? { createdAt: -1 } : undefined;
+      const limit = wantLimit ? 10 : 100;
+      return { operation: 'find', queryString: 'Heuristic find', collection, filter, sort, limit, projection: { password: 0 } } as any;
+    } else {
+      const tableFull = pickName() || (dbType === 'postgres' ? 'public.users' : 'users');
+      const table = tableFull;
+      if (wantCount) {
+        return { operation: 'sql', queryString: 'Count rows', sql: `SELECT COUNT(*) AS count FROM ${table}`, parameters: [] } as any;
+      }
+      const order = wantLatest ? ' ORDER BY created_at DESC' : '';
+      const limit = wantLimit ? ' LIMIT 10' : ' LIMIT 100';
+      return { operation: 'sql', queryString: 'Heuristic select', sql: `SELECT * FROM ${table}${order}${limit}`, parameters: [] } as any;
+    }
+  }
+
+  private async generateMongoQuery(userQuery: string, schemaInfo: string, memoryContext: string): Promise<MongoQueryObject> {
+    const systemPrompt = `You are a strict, safety-first MongoDB query generator. Generate optimized and SAFE MongoDB operations (CRUD and analysis) from natural language, the database schema, and user history.
 
 Database Schema:
 ${schemaInfo}
 
 ${memoryContext}
 
-Rules:
-1. Generate only valid MongoDB queries for the available collections
-2. Use appropriate MongoDB operators ($eq, $ne, $gt, $lt, $gte, $lte, $in, $regex, etc.)
-3. Always exclude password and sensitive fields in projections
-4. Consider the user's skill level and previous query patterns
-5. For beginners, prefer simpler queries; for advanced users, suggest more complex operations
-6. If user frequently queries certain collections, prioritize those
-7. Use the user's previous successful query patterns as guidance
-8. Return the response in this exact JSON format:
+Strong Safety Rules:
+1) NEVER generate deleteMany or updateMany. Only allow deleteOne and updateOne.
+2) NEVER generate deleteOne or updateOne with an empty filter. The filter MUST target a specific document (e.g., by _id or another unique field).
+3) NEVER include sensitive fields (like password, accessToken, secrets) in projections or write payloads.
+4) For updates, prefer $set and do not unset critical identifiers.
+5) For aggregates, do not use $out/$merge stages.
+6) For reads, prefer minimal projections (exclude sensitive fields).
+7) Always specify the collection name.
 
+Relationship Guidance:
+- If schema relationships indicate references between collections, prefer aggregation with $lookup to join related data. Use indexed fields for join keys when possible.
+
+Output JSON Format (pick the appropriate fields per operation):
 {
-  "operation": "find|findOne|aggregate|count",
-  "queryString": "Human readable description of what the query does",
+  "operation": "find|findOne|aggregate|count|insertOne|updateOne|deleteOne",
+  "queryString": "Human readable description",
   "collection": "collection_name",
-  "filter": {MongoDB filter object},
-  "projection": {MongoDB projection object},
-  "sort": {MongoDB sort object if needed},
-  "limit": number if needed
+  "filter": { ... },
+  "projection": { ... },
+  "sort": { ... },
+  "limit": number,
+  "pipeline": [ ... ],
+  "document": { ... },
+  "update": { "$set": { ... } },
+  "options": { ... }
 }
 
-Important:
-- Always specify the collection name
-- For user queries, default to "users" collection unless another collection is clearly specified
+Additional Guidance:
 - Use regex for text searches: {"field": {"$regex": "pattern", "$options": "i"}}
-- For date ranges, use appropriate date objects
-- Consider user's frequent patterns and suggest optimizations
+- Use DATE_7_DAYS_AGO, DATE_30_DAYS_AGO, DATE_TODAY placeholders in filters; they will be converted to Date objects.
+- For write operations, only include relevant fields, never passwords.
 
 Examples:
-- "Get all users" → {"operation": "find", "collection": "users", "queryString": "Find all users", "filter": {}, "projection": {"password": 0}}
-- "Find user with email john@example.com" → {"operation": "findOne", "collection": "users", "queryString": "Find user by email", "filter": {"email": "john@example.com"}, "projection": {"password": 0}}`;
+- Read: {"operation":"find","collection":"users","queryString":"Get first 10 users","filter":{},"projection":{"password":0},"sort":{"createdAt":-1},"limit":10}
+- Insert: {"operation":"insertOne","collection":"products","queryString":"Create a product","document":{"name":"Remede Serum","price":59.99}}
+- Update: {"operation":"updateOne","collection":"products","queryString":"Update product price","filter":{"sku":"RMD-001"},"update":{"$set":{"price":69.99}}}
+- Delete (safe): {"operation":"deleteOne","collection":"products","queryString":"Remove discontinued product","filter":{"sku":"RMD-001"}}
+\nImportant: Do not include markdown or code fences, and reply with a single JSON object only.`;
 
     const messages = [new SystemMessage(systemPrompt), new HumanMessage(userQuery)];
-
     const response = await this.llm.invoke(messages);
 
     try {
-      const jsonMatch = response.content.toString().match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No valid JSON found in AI response');
-      }
-
-      const queryObject = JSON.parse(jsonMatch[0]);
+      const raw = response.content.toString();
+      const extracted = this.extractFirstJsonObject(raw);
+      const queryObject = JSON.parse(extracted);
 
       if (!queryObject.operation || !queryObject.queryString) {
         throw new Error('Invalid query object structure');
       }
 
-      // Handle date placeholders
       if (queryObject.filter) {
-        queryObject.filter = this.replaceDatePlaceholders(queryObject.filter);
+        queryObject.filter = this.postProcessFilter(queryObject.filter);
       }
 
-      // Ensure collection is specified
       if (!queryObject.collection) {
-        queryObject.collection = 'users'; // Default fallback
+        queryObject.collection = 'users';
       }
 
       return queryObject;
@@ -219,22 +864,27 @@ Examples:
     }
   }
 
-  private async generateSQLQuery(userQuery: string, schemaInfo: string, memoryContext: string, dbType: 'postgres' | 'mysql'): Promise<SQLQueryObject> {
-    const systemPrompt = `You are an advanced ${dbType.toUpperCase()} SQL query generator with user context awareness. Generate optimized SQL queries based on the user's natural language input, database schema, and their query history.
+  private async generateSQLQuery(
+    userQuery: string,
+    schemaInfo: string,
+    memoryContext: string,
+    dbType: 'postgres' | 'mysql',
+  ): Promise<SQLQueryObject> {
+    const systemPrompt = `You are a strict, safety-first ${dbType.toUpperCase()} SQL generator. Generate optimized and SAFE SQL (CRUD and analysis) from natural language, the database schema, and user history.
 
 Database Schema:
 ${schemaInfo}
 
 ${memoryContext}
 
-Rules:
-1. Generate only valid ${dbType.toUpperCase()} SQL queries for the available tables
-2. Use appropriate SQL operators and functions
-3. Always exclude password and sensitive fields in SELECT statements
-4. Consider the user's skill level and previous query patterns
-5. For beginners, prefer simpler queries; for advanced users, suggest more complex operations
-6. Use parameterized queries when appropriate
-7. Return the response in this exact JSON format:
+Strong Safety Rules:
+1) ALWAYS use parameterized queries. For Postgres use $1,$2,... and for MySQL use ? placeholders.
+2) NEVER generate DELETE without a highly specific WHERE clause. Forbid mass deletions.
+3) NEVER generate UPDATE without a highly specific WHERE clause.
+4) NEVER drop or truncate tables, or alter schema.
+5) ALWAYS exclude sensitive fields (password, accessToken, secrets) in SELECT/INSERT/UPDATE.
+6) Prefer LIMIT for reads.
+7) Return the response in this exact JSON format:
 
 {
   "operation": "sql",
@@ -242,6 +892,11 @@ Rules:
   "sql": "SELECT * FROM table_name WHERE condition",
   "parameters": [optional array of parameters for parameterized queries]
 }
+
+Relationship and Naming Guidance:
+- The schema JSON includes: table, columns, primary_key, foreign_keys. When joining, prefer the foreign_keys provided rather than guessing.
+- Use table names exactly as listed in Database Schema, including schema prefixes (e.g., public.users) when present.
+- Prefer qualified column names (table.column) to avoid ambiguity in joins.
 
 Important:
 - Always use proper SQL syntax for ${dbType.toUpperCase()}
@@ -251,19 +906,18 @@ Important:
 - Exclude sensitive fields like passwords
 
 Examples:
-- "Get all users" → {"operation": "sql", "queryString": "Find all users", "sql": "SELECT id, name, email, created_at FROM users", "parameters": []}
-- "Find user with email john@example.com" → {"operation": "sql", "queryString": "Find user by email", "sql": "SELECT id, name, email FROM users WHERE email = $1", "parameters": ["john@example.com"]}`;
+- Read: {"operation": "sql", "queryString": "Find all users", "sql": "SELECT id, name, email, created_at FROM users LIMIT 10", "parameters": []}
+- Update (safe): {"operation": "sql", "queryString": "Update product price", "sql": "UPDATE products SET price = $1 WHERE sku = $2", "parameters": [69.99, "RMD-001"]}
+- Delete (safe): {"operation": "sql", "queryString": "Delete discontinued product", "sql": "DELETE FROM products WHERE sku = $1", "parameters": ["RMD-001"]}
+\nImportant: Do not include markdown or code fences, and reply with a single JSON object only.`;
 
     const messages = [new SystemMessage(systemPrompt), new HumanMessage(userQuery)];
     const response = await this.llm.invoke(messages);
 
     try {
-      const jsonMatch = response.content.toString().match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No valid JSON found in AI response');
-      }
-
-      const queryObject = JSON.parse(jsonMatch[0]);
+      const raw = response.content.toString();
+      const extracted = this.extractFirstJsonObject(raw);
+      const queryObject = JSON.parse(extracted);
 
       if (!queryObject.operation || !queryObject.queryString || !queryObject.sql) {
         throw new Error('Invalid SQL query object structure');
@@ -308,24 +962,176 @@ Examples:
     return processValue(filter);
   }
 
+  // Convert common non-JSON tokens produced by LLM into proper JSON
+  private sanitizeJsonContent(text: string): string {
+    return text
+      .replace(/ObjectId\("([0-9a-fA-F]{24})"\)/g, '"$1"')
+      .replace(/new Date\("([^"]+)"\)/g, '"$1"')
+      .replace(/ISODate\("([^"]+)"\)/g, '"$1"')
+      .replace(/\bTrue\b/g, 'true')
+      .replace(/\bFalse\b/g, 'false')
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'");
+  }
+
+  // Robustly extract the first JSON object from an LLM response, tolerating code fences and text
+  private extractFirstJsonObject(text: string): string {
+    const sanitizedText = this.sanitizeJsonContent(String(text || ''));
+    // Remove code fences like ```json ... ``` or ``` ... ```
+    let withoutFences = sanitizedText;
+    withoutFences = withoutFences.replace(/```json\s*([\s\S]*?)\s*```/gi, '$1');
+    withoutFences = withoutFences.replace(/```\s*([\s\S]*?)\s*```/g, '$1');
+
+    // Quick fast-path: simple { ... }
+    const directMatch = withoutFences.match(/\{[\s\S]*\}/);
+    if (directMatch) {
+      return directMatch[0];
+    }
+
+    // Bracket counting parser to find the first balanced JSON object
+    let depth = 0;
+    let start = -1;
+    for (let i = 0; i < withoutFences.length; i++) {
+      const ch = withoutFences[i];
+      if (ch === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === '}') {
+        if (depth > 0) depth--;
+        if (depth === 0 && start !== -1) {
+          return withoutFences.slice(start, i + 1);
+        }
+      }
+    }
+    throw new Error('No valid JSON found in AI response');
+  }
+
+  // Similar to extractFirstJsonObject but allows arrays as top-level JSON
+  private extractFirstJson(text: string): string {
+    let sanitizedText = this.sanitizeJsonContent(String(text || ''));
+    sanitizedText = sanitizedText.replace(/```json\s*([\s\S]*?)\s*```/gi, '$1');
+    sanitizedText = sanitizedText.replace(/```\s*([\s\S]*?)\s*```/g, '$1');
+
+    // Try object first
+    const obj = sanitizedText.match(/\{[\s\S]*\}/);
+    if (obj) return obj[0];
+
+    // Try array
+    const arr = sanitizedText.match(/\[[\s\S]*\]/);
+    if (arr) return arr[0];
+
+    // Fallback bracket counting for object
+    let depth = 0;
+    let start = -1;
+    for (let i = 0; i < sanitizedText.length; i++) {
+      const ch = sanitizedText[i];
+      if (ch === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === '}') {
+        if (depth > 0) depth--;
+        if (depth === 0 && start !== -1) return sanitizedText.slice(start, i + 1);
+      }
+    }
+    // Fallback for array (simple)
+    const firstOpen = sanitizedText.indexOf('[');
+    const lastClose = sanitizedText.lastIndexOf(']');
+    if (firstOpen >= 0 && lastClose > firstOpen) return sanitizedText.slice(firstOpen, lastClose + 1);
+    throw new Error('No valid JSON found in AI response');
+  }
+
+  // Post-process filter: convert placeholders and typed strings into proper types
+  private postProcessFilter(filter: any): any {
+    const processed = this.replaceDatePlaceholders(filter);
+    // Convert stringified ObjectId-like fields to actual ObjectId if safe
+    const convert = (obj: any): any => {
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        for (const key of Object.keys(obj)) {
+          const val = obj[key];
+          if (typeof val === 'string' && /^[0-9a-fA-F]{24}$/.test(val)) {
+            try {
+              obj[key] = new (mongoose as any).Types.ObjectId(val);
+            } catch {
+              /* ignore */
+            }
+          } else if (typeof val === 'object') {
+            obj[key] = convert(val);
+          }
+        }
+      } else if (Array.isArray(obj)) {
+        return obj.map(v => convert(v));
+      }
+      return obj;
+    };
+    return convert(processed);
+  }
+
   private async executeQuery(queryObj: MongoQueryObject | SQLQueryObject, dbConnection: any): Promise<any> {
     logger.info(`Executing ${queryObj.operation} query: ${queryObj.queryString}`);
 
     try {
       if (queryObj.operation === 'sql') {
         const sqlQuery = queryObj as SQLQueryObject;
+        // Guardrail: block dangerous SQL verbs
+        let sqlText = sqlQuery.sql || '';
+        const lowerSql = sqlText.toLowerCase();
+        if (/\b(drop|truncate|alter)\b/.test(lowerSql)) {
+          throw new Error('Dangerous SQL operation blocked');
+        }
+
+        // Guardrail: prevent mass UPDATE/DELETE without WHERE
+        if (/^\s*delete\b/.test(lowerSql) && !/\bwhere\b/.test(lowerSql)) {
+          throw new Error('DELETE without WHERE is blocked');
+        }
+        if (/^\s*update\b/.test(lowerSql) && !/\bwhere\b/.test(lowerSql)) {
+          throw new Error('UPDATE without WHERE is blocked');
+        }
+
+        // Additional SQL hardening
+        if (/--|\/\*/.test(sqlText)) {
+          throw new Error('SQL comments are blocked');
+        }
+        const semicolons = (sqlText.match(/;/g) || []).length;
+        if (semicolons > 1) {
+          throw new Error('Multiple SQL statements are blocked');
+        }
+        sqlText = sqlText.replace(/;\s*$/, '');
+
         if (dbConnection.type === 'postgres') {
-          const result = await dbConnection.pg.query(sqlQuery.sql, sqlQuery.parameters || []);
-          return result.rows;
+          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('SQL query timeout')), QUERY_TIMEOUT_MS));
+          const queryPromise = dbConnection.pg.query(sqlText, sqlQuery.parameters || []);
+          const result = await Promise.race([queryPromise, timeoutPromise]);
+          return (result as any).rows;
         } else if (dbConnection.type === 'mysql') {
-          const [rows] = await dbConnection.mysql.execute(sqlQuery.sql, sqlQuery.parameters || []);
+          // Normalize Postgres-style params ($1,$2,...) to MySQL (?) if needed
+          let sql = sqlText;
+          if (/\$\d+/.test(sql)) {
+            const paramCount = (sql.match(/\$\d+/g) || []).length;
+            sql = sql.replace(/\$\d+/g, '?');
+            if ((sqlQuery.parameters || []).length !== paramCount) {
+              throw new Error('Parameter count mismatch after normalization');
+            }
+          }
+          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('SQL query timeout')), QUERY_TIMEOUT_MS));
+          const execPromise = dbConnection.mysql.execute(sql, sqlQuery.parameters || []);
+          const result = await Promise.race([execPromise, timeoutPromise]);
+          const [rows] = result as any;
           return rows;
         }
       } else {
         // MongoDB query
         const mongoQuery = queryObj as MongoQueryObject;
-        const { operation, collection, filter = {}, projection = { password: 0 }, sort, limit } = mongoQuery;
-        
+        const { operation, collection, filter = {}, projection = { password: 0 }, sort, limit, document, update } = mongoQuery;
+        // Guardrail: block dangerous Mongo operators in filters
+        const containsDangerousMongo = (obj: any): boolean => {
+          if (!obj || typeof obj !== 'object') return false;
+          if (Array.isArray(obj)) return obj.some(containsDangerousMongo);
+          return Object.keys(obj).some(k => k === '$where' || k === '$function' || (typeof obj[k] === 'object' && containsDangerousMongo(obj[k])));
+        };
+        if (containsDangerousMongo(filter)) {
+          throw new Error('Dangerous Mongo operator in filter is blocked');
+        }
+
         // Get the appropriate model
         const model = this.getModelForCollection(collection, dbConnection.mongo);
 
@@ -333,7 +1139,7 @@ Examples:
           case 'find':
             let query = model.find(filter, projection);
             if (sort) query = query.sort(sort);
-            if (limit) query = query.limit(limit);
+            query = query.limit(Math.min(limit || DEFAULT_ROW_LIMIT, DEFAULT_ROW_LIMIT));
             return await query.exec();
 
           case 'findOne':
@@ -343,8 +1149,32 @@ Examples:
             return await model.countDocuments(filter).exec();
 
           case 'aggregate':
-            const pipeline = filter.pipeline || [{ $match: filter }];
-            return await model.aggregate(pipeline).exec();
+            const pipeline = (mongoQuery as any).pipeline || filter.pipeline || [{ $match: filter }];
+            // Guardrail: forbid $out / $merge
+            if (Array.isArray(pipeline) && pipeline.some((st: any) => st.$out || st.$merge)) {
+              throw new Error('Dangerous Mongo aggregation stage blocked');
+            }
+            const limitedPipeline = Array.isArray(pipeline) ? [...pipeline] : pipeline;
+            // Append limit if none exists
+            if (Array.isArray(limitedPipeline) && !limitedPipeline.some((st: any) => st.$limit)) {
+              limitedPipeline.push({ $limit: DEFAULT_ROW_LIMIT });
+            }
+            return await model.aggregate(limitedPipeline).exec();
+
+          case 'insertOne':
+            if (!document || typeof document !== 'object') throw new Error('insertOne requires a document');
+            if ('password' in document) delete (document as any).password;
+            return await model.create(document);
+
+          case 'updateOne':
+            if (!filter || Object.keys(filter).length === 0) throw new Error('updateOne requires a specific filter');
+            if (!update || typeof update !== 'object') throw new Error('updateOne requires an update object');
+            const safeUpdate = Object.keys(update).some(k => k.startsWith('$')) ? update : { $set: update };
+            return await model.updateOne(filter, safeUpdate, { upsert: false });
+
+          case 'deleteOne':
+            if (!filter || Object.keys(filter).length === 0) throw new Error('deleteOne requires a specific filter');
+            return await model.deleteOne(filter);
 
           default:
             throw new Error(`Unsupported operation: ${operation}`);
@@ -358,7 +1188,7 @@ Examples:
 
   private getModelForCollection(collectionName: string, conn?: mongoose.Connection): any {
     const connection = conn || mongoose.connection;
-    
+
     // Try to find existing mongoose model
     const existingModel = Object.values(connection.models).find((model: any) => model.collection.name === collectionName);
 
@@ -368,7 +1198,7 @@ Examples:
 
     // Create dynamic model if not found
     const dynamicSchema = new mongoose.Schema({}, { strict: false });
-    return connection.model(collectionName, dynamicSchema);
+    return connection.model(collectionName, dynamicSchema, collectionName);
   }
 
   public async getSampleQueries(): Promise<string[]> {
@@ -385,6 +1215,11 @@ Examples:
       'Show me all tables',
       'Get all records from products table',
       'Find orders from last month',
+      // CRUD + Analysis examples
+      'Create a new product named Remede Serum with price 59.99',
+      'Update the price of product with SKU RMD-001 to 69.99',
+      'Delete the product with SKU RMD-001',
+      'Show top 5 products by revenue in last 30 days',
     ];
   }
 
@@ -398,5 +1233,19 @@ Examples:
 
   public async refreshSchemaCache(): Promise<void> {
     await this.schemaDetector.refreshCache();
+  }
+
+  // Explicit profiling endpoint: returns normalized schema JSON and capability summary
+  public async profileDatabase(dbUrl: string, dbType?: DBType): Promise<{ schema: string; capabilitySummary: string; dbType: DBType }> {
+    const conn = await this.dbPool.get(dbUrl, dbType);
+    const effectiveType = conn.type as DBType;
+    const schema = await this.schemaRegistry.getOrBuildSchemaString(dbUrl, effectiveType, conn, true);
+    const capabilitySummary = await this.profiler.getCapabilitiesSummary(conn);
+    return { schema, capabilitySummary, dbType: effectiveType };
+  }
+
+  // Lightweight connection check (reuses pool/connection, will not create duplicates for same URL)
+  public async testConnection(dbUrl: string, dbType?: DBType): Promise<{ ok: boolean; type?: DBType; details?: any }> {
+    return this.dbPool.getConnectionStatus(dbUrl, dbType);
   }
 }
