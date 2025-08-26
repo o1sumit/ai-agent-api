@@ -48,6 +48,22 @@ export class SchemaRegistryService {
     return schemaJson;
   }
 
+  public getDbIdentity(dbUrl: string, dbType?: DBType): { normalizedUrl: string; dbKey: string } {
+    const effectiveType = dbType || this.detectDbType(dbUrl);
+    const normalizedUrl = this.normalizeUrl(dbUrl, effectiveType);
+    const dbKey = this.hashDbKey(effectiveType, normalizedUrl);
+    return { normalizedUrl, dbKey };
+  }
+
+  private detectDbType(dbUrl: string): DBType {
+    const lower = (dbUrl || '').toLowerCase();
+    if (lower.startsWith('mongodb://') || lower.startsWith('mongodb+srv://')) return 'mongodb';
+    if (lower.startsWith('postgres://') || lower.startsWith('postgresql://')) return 'postgres';
+    if (lower.startsWith('mysql://') || lower.startsWith('mysql2://')) return 'mysql';
+    // Default to postgres for SQL memory partitioning when unknown
+    return 'postgres';
+  }
+
   private isStale(doc: SchemaRegistryDoc): boolean {
     return Date.now() - new Date(doc.lastUpdated).getTime() > (doc.ttlMs || this.DEFAULT_TTL_MS);
   }

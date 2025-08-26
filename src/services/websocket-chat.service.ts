@@ -126,48 +126,27 @@ export class WebSocketChatService {
       socket.on('send-message', async (data: WebSocketEvents['send-message']) => {
         try {
           const { message, sessionId, dbUrl, dbType, dryRun } = data;
-          const userId = socket.userId;
+          const userId = socket.userId || 'anonymous';
 
-          // Validate session access
-          const session = await ChatSessionModel.findOne({ id: sessionId, userId });
-          if (!session) {
-            socket.emit('error', { message: 'Session not found' });
-            return;
-          }
+          const session = (await ChatSessionModel.findOne({ id: sessionId, userId })) || (await this.createSession(userId, 'Chat Session', sessionId));
 
-          // Create user message
-          const userMessage = await this.createMessage({
-            userId,
-            sessionId,
-            message,
-            type: 'user',
-          });
-
-          // Broadcast user message to session
-          this.io.to(sessionId).emit('message-received', userMessage);
-
-          // Show thinking indicator
-          if (this.config.enableThinkingProcess) {
-            this.io.to(sessionId).emit('agent-thinking', {
-              message: 'Analyzing your request...',
-              sessionId,
-            });
-          }
-
-          // Get conversation history
-          const conversationHistory = await ChatMessageModel.find({ sessionId }).sort({ createdAt: -1 }).limit(20).lean();
-
-          // Determine effective DB context
+          // Determine effective DB context: prefer incoming dbUrl, else session-stored
           let effectiveDbUrl = dbUrl;
-          let effectiveDbType = dbType as any;
-          try {
-            if (!effectiveDbUrl && session?.context?.databaseContext && session.context.databaseContext.length > 0) {
-              const stored = JSON.parse(String(session.context.databaseContext[0]));
-              if (stored?.dbUrl) effectiveDbUrl = stored.dbUrl;
-              if (stored?.dbType) effectiveDbType = stored.dbType;
-            }
-          } catch (_) {
-            // ignore parse errors
+          let effectiveDbType = dbType;
+          if (!effectiveDbUrl && session?.context?.databaseContext && session.context.databaseContext.length > 0) {
+            const stored = JSON.parse(String(session.context.databaseContext[0]));
+            if (stored?.dbUrl) effectiveDbUrl = stored.dbUrl;
+            if (!effectiveDbType && stored?.dbType) effectiveDbType = stored.dbType as any;
+          }
+
+          // If user provided a new dbUrl, update the session context immediately
+          if (dbUrl) {
+            try {
+              if (!session.context) session.context = {} as any;
+              const packed = JSON.stringify({ dbUrl, dbType: effectiveDbType });
+              session.context.databaseContext = [packed];
+              await (session as any).save?.();
+            } catch (_) {}
           }
 
           // Process message
@@ -193,11 +172,13 @@ export class WebSocketChatService {
               if (!session.context) session.context = {} as any;
               const packed = JSON.stringify({ dbUrl: effectiveDbUrl, dbType: effectiveDbType });
               session.context.databaseContext = [packed];
+              await (session as any).save?.();
             } catch (_) {
               // ignore
             }
           } else {
             // Fallback to LangGraph-based workflow with enriched context
+            const conversationHistory = await ChatMessageModel.find({ sessionId }).sort({ createdAt: -1 }).limit(20).lean();
             const enrichedHistory = conversationHistory.reverse();
             agentResponse = await this.databaseAgent.processMessage(message, userId, sessionId, enrichedHistory);
           }
@@ -218,37 +199,14 @@ export class WebSocketChatService {
           });
 
           // Update session
-          session.messageCount += 2; // user + agent message
+          session.messageCount += 2;
           session.lastActivity = new Date();
+          await (session as any).save?.();
 
-          // Update context
-          if (!session.context) session.context = {};
-          session.context.recentQueries = [message, ...(session.context.recentQueries || []).slice(0, 4)];
-
-          await session.save();
-
-          // Record in memory system
-          await this.memoryService.recordQuery(
-            userId,
-            message,
-            agentResponse.message,
-            'find', // This would be determined by the agent
-            ['chat'],
-            agentResponse.executionTime || 0,
-            agentResponse.data ? (Array.isArray(agentResponse.data) ? agentResponse.data.length : 1) : 0,
-            agentResponse.type !== 'error',
-          );
-
-          // Send agent response
-          this.io.to(sessionId).emit('message-received', agentMessage);
-          this.io.to(sessionId).emit('agent-response', {
-            response: agentResponse,
-            sessionId,
-          });
-
-          logger.info(`Message processed for session ${sessionId}`);
+          // Emit agent message back
+          this.io.to(socket.id).emit('message', agentMessage);
         } catch (error) {
-          logger.error(`Error processing message: ${error.message}`);
+          logger.error(`send-message error: ${(error as any)?.message}`);
           socket.emit('error', { message: 'Failed to process message' });
         }
       });

@@ -7,6 +7,7 @@ import { logger } from '@utils/logger';
 export class AIMemoryService {
   public async recordQuery(
     userId: string,
+    dbKey: string | undefined,
     query: string,
     generatedMongoQuery: string,
     queryType: 'find' | 'findOne' | 'count' | 'aggregate',
@@ -22,6 +23,7 @@ export class AIMemoryService {
       // Record the query
       await AIMemoryModel.create({
         userId,
+        dbKey,
         query,
         generatedMongoQuery,
         queryType,
@@ -42,12 +44,12 @@ export class AIMemoryService {
     }
   }
 
-  public async getMemoryInsights(userId: string, currentQuery: string): Promise<MemoryInsight> {
+  public async getMemoryInsights(userId: string, currentQuery: string, dbKey?: string): Promise<MemoryInsight> {
     try {
       const queryPattern = this.extractQueryPattern(currentQuery);
 
       // Get similar queries from user's history
-      const similarQueries = await this.getSimilarQueries(userId, queryPattern, currentQuery);
+      const similarQueries = await this.getSimilarQueries(userId, queryPattern, currentQuery, dbKey);
 
       // Get user preferences
       const userPreferences = await UserPreferencesModel.findOne({ userId });
@@ -72,14 +74,12 @@ export class AIMemoryService {
     }
   }
 
-  private async getSimilarQueries(userId: string, queryPattern: string, currentQuery: string): Promise<AIMemory[]> {
+  private async getSimilarQueries(userId: string, queryPattern: string, currentQuery: string, dbKey?: string): Promise<AIMemory[]> {
     try {
       // First, try exact pattern match
-      let similarQueries = await AIMemoryModel.find({
-        userId,
-        queryPattern,
-        wasSuccessful: true,
-      })
+      const baseFilter: any = { userId, queryPattern, wasSuccessful: true };
+      if (dbKey) baseFilter.dbKey = dbKey;
+      let similarQueries = await AIMemoryModel.find(baseFilter)
         .sort({ createdAt: -1 })
         .limit(3)
         .lean();
@@ -89,11 +89,9 @@ export class AIMemoryService {
         const keywords = this.extractKeywords(currentQuery);
         const regexPattern = new RegExp(keywords.join('|'), 'i');
 
-        similarQueries = await AIMemoryModel.find({
-          userId,
-          $or: [{ query: regexPattern }, { queryPattern: regexPattern }],
-          wasSuccessful: true,
-        })
+        const fuzzyFilter: any = { userId, $or: [{ query: regexPattern }, { queryPattern: regexPattern }], wasSuccessful: true };
+        if (dbKey) fuzzyFilter.dbKey = dbKey;
+        similarQueries = await AIMemoryModel.find(fuzzyFilter)
           .sort({ createdAt: -1 })
           .limit(3)
           .lean();

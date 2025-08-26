@@ -89,8 +89,11 @@ export class AIAgentService {
       // Get database connection
       const dbConnection = await this.dbPool.get(dbOptions.dbUrl, dbOptions.dbType);
 
-      // Get memory insights for the user
-      const memoryInsights = await this.memoryService.getMemoryInsights(userId, userQuery);
+      // Derive db identity for per-db memory and context
+      const { dbKey } = this.schemaRegistry.getDbIdentity(dbOptions.dbUrl, dbConnection.type);
+
+      // Get memory insights for the user scoped to this dbKey
+      const memoryInsights = await this.memoryService.getMemoryInsights(userId, userQuery, dbKey);
 
       // Early exit for greetings/small talk without hitting the database
       if (this.isGreeting(userQuery)) {
@@ -100,6 +103,7 @@ export class AIAgentService {
         try {
           await this.memoryService.recordQuery(
             userId,
+            dbKey,
             userQuery,
             'Conversation detected: no database query executed',
             'find',
@@ -124,6 +128,137 @@ export class AIAgentService {
             queryPattern: memoryInsights.queryPattern,
           },
         };
+      }
+
+      // Schema exploration shortcuts (no LLM needed): "show tables", "list tables", "show schema", "describe schema"
+      if (/^(show|list)\s+(tables|schema|schemas)$/i.test(userQuery) || /(show|list)\s+(tables|schema|schemas)/i.test(userQuery)) {
+        const schemaString = await this.schemaRegistry.getOrBuildSchemaString(
+          dbOptions.dbUrl,
+          dbConnection.type,
+          dbConnection,
+          !!dbOptions.refreshSchema,
+        );
+        const parsed = (() => {
+          try {
+            return JSON.parse(schemaString);
+          } catch {
+            return [];
+          }
+        })();
+        const tablesOrCollections = Array.isArray(parsed) ? parsed.map((t: any) => t.table || t.collection || '').filter(Boolean) : [];
+        const executionTime = Date.now() - startTime;
+        return {
+          data: tablesOrCollections,
+          message: `Found ${tablesOrCollections.length} ${dbConnection.type === 'mongodb' ? 'collections' : 'tables'}`,
+          query: 'Schema exploration',
+          suggestions: [],
+          executionTime,
+          executedQueries: [],
+          plan: { steps: [] },
+          trace: [],
+          memoryInsights: { similarQueries: 0, userLevel: 'beginner', queryPattern: 'schema' },
+        } as any;
+      }
+
+      // Relationship/foreign-key exploration shortcuts
+      if (/(show|list|describe)\s+(relations|relationships|foreign\s*keys|fks|references)/i.test(userQuery)) {
+        const schemaString = await this.schemaRegistry.getOrBuildSchemaString(
+          dbOptions.dbUrl,
+          dbConnection.type,
+          dbConnection,
+          !!dbOptions.refreshSchema,
+        );
+        const parsed = (() => {
+          try {
+            return JSON.parse(schemaString);
+          } catch {
+            return [];
+          }
+        })();
+        const relations: Array<{ fromTable: string; fromColumn: string; toTable: string; toColumn: string }> = [];
+        if (Array.isArray(parsed)) {
+          for (const t of parsed) {
+            const tableName = t.table || t.collection;
+            if (t?.foreign_keys && Array.isArray(t.foreign_keys)) {
+              for (const fk of t.foreign_keys) {
+                relations.push({ fromTable: tableName, fromColumn: fk.column_name, toTable: fk.references_table, toColumn: fk.references_column });
+              }
+            }
+            if (!t?.foreign_keys && t?.relationships && Array.isArray(t.relationships)) {
+              for (const rel of t.relationships) {
+                if (rel?.collection || rel?.references_collection) {
+                  relations.push({
+                    fromTable: tableName,
+                    fromColumn: rel.localField || rel.local_field || 'unknown',
+                    toTable: rel.collection || rel.references_collection,
+                    toColumn: rel.foreignField || rel.foreign_field || 'unknown',
+                  });
+                }
+              }
+            }
+          }
+        }
+        const executionTime = Date.now() - startTime;
+        return {
+          data: relations,
+          message: `Found ${relations.length} relationship(s)`,
+          query: 'Relationship exploration',
+          suggestions: [],
+          executionTime,
+          executedQueries: [],
+          plan: { steps: [] },
+          trace: [],
+          memoryInsights: { similarQueries: 0, userLevel: 'beginner', queryPattern: 'relationships' },
+        } as any;
+      }
+
+      // Describe columns of a specific table/collection
+      const describeMatch =
+        userQuery.match(/(?:show|list|describe)\s+(?:columns?|structure|schema|fields?)\s+(?:for|of|in)?\s*([a-zA-Z0-9_\.]+)/i) ||
+        userQuery.match(/^describe\s+([a-zA-Z0-9_\.]+)/i);
+      if (describeMatch && describeMatch[1]) {
+        const targetRaw = describeMatch[1].toLowerCase();
+        const schemaString = await this.schemaRegistry.getOrBuildSchemaString(
+          dbOptions.dbUrl,
+          dbConnection.type,
+          dbConnection,
+          !!dbOptions.refreshSchema,
+        );
+        const parsed = (() => {
+          try {
+            return JSON.parse(schemaString);
+          } catch {
+            return [];
+          }
+        })();
+        let found: any = null;
+        if (Array.isArray(parsed)) {
+          // Find best matching table/collection
+          const candidates = parsed.filter((t: any) => {
+            const name = String(t.table || t.collection || '').toLowerCase();
+            const short = name.includes('.') ? name.split('.').pop() : name;
+            return name === targetRaw || short === targetRaw || name.endsWith(`.${targetRaw}`) || short.includes(targetRaw);
+          });
+          found = candidates[0];
+        }
+        const columns = (found?.columns || []).map((c: any) => ({
+          column_name: c.column_name || c.name || c.field,
+          data_type: c.data_type || c.type || 'unknown',
+          is_nullable: c.is_nullable ?? 'unknown',
+          is_primary: Array.isArray(found?.primary_key) ? found.primary_key.includes(c.column_name) : false,
+        }));
+        const executionTime = Date.now() - startTime;
+        return {
+          data: columns,
+          message: found ? `Columns for ${found.table || found.collection}` : 'No matching table/collection found',
+          query: 'Columns exploration',
+          suggestions: [],
+          executionTime,
+          executedQueries: [],
+          plan: { steps: [] },
+          trace: [],
+          memoryInsights: { similarQueries: 0, userLevel: 'beginner', queryPattern: 'columns' },
+        } as any;
       }
 
       // Get database schema from persistent registry (build if missing/stale)
@@ -201,7 +336,14 @@ export class AIAgentService {
       } catch (planError: any) {
         logger.warn(`Plan-execute flow failed, falling back to single-shot: ${planError.message}`);
         // Fallback to single-shot query generation
-        const queryObject = await this.generateQuery(userQuery, schemaInfo, { ...memoryInsights, capabilitySummary, schemaHints }, dbConnection.type);
+        let queryObject: MongoQueryObject | SQLQueryObject | null = null;
+        try {
+          queryObject = await this.generateQuery(userQuery, schemaInfo, { ...memoryInsights, capabilitySummary, schemaHints }, dbConnection.type);
+        } catch (e: any) {
+          // Heuristic fallback if LLM JSON failed
+          logger.warn(`Single-shot generation failed, using heuristic fallback: ${e.message}`);
+          queryObject = await this.generateHeuristicQuery(userQuery, schemaInfo, dbConnection.type);
+        }
         if (dbOptions.dryRun) {
           executedQueries = [{ queryObject, result: null }];
         } else {
@@ -220,6 +362,7 @@ export class AIAgentService {
           const first = executedQueries[0].queryObject;
           await this.memoryService.recordQuery(
             userId,
+            dbKey,
             userQuery,
             first.queryString,
             (first as any).operation,
@@ -231,6 +374,7 @@ export class AIAgentService {
         } else {
           await this.memoryService.recordQuery(
             userId,
+            dbKey,
             userQuery,
             'Plan executed without direct DB query',
             'find',
@@ -280,7 +424,8 @@ export class AIAgentService {
 
       // Record failed query
       try {
-        await this.memoryService.recordQuery(userId, userQuery, 'FAILED', 'find', ['unknown'], executionTime, 0, false);
+        const { dbKey } = this.schemaRegistry.getDbIdentity(dbOptions.dbUrl, dbOptions.dbType as DBType);
+        await this.memoryService.recordQuery(userId, dbKey, userQuery, 'FAILED', 'find', ['unknown'], executionTime, 0, false);
       } catch (memoryError: any) {
         logger.error(`Failed to record failed query: ${memoryError.message}`);
       }
@@ -346,7 +491,7 @@ Rules:
 - Prefer a single db_query step when sufficient.
 - For analysis or recommendations, first fetch relevant data (db_query), then compute_statistics if numeric/categorical summaries help, and optionally do llm_analysis to explain/advise.
 - Keep the plan minimal but sufficient.
-- Output strictly valid JSON in this schema:
+- Output strictly valid JSON in this schema (no markdown/code fences, no commentary; the entire reply MUST be a single JSON object):
 {
   "steps": [
     { "type": "db_query", "description": "...", "subQuery": "..." },
@@ -355,14 +500,41 @@ Rules:
   ]
 }`;
 
-    const response = await this.llm.invoke([new SystemMessage(planningPrompt), new HumanMessage('Return only the JSON object for the plan.')]);
-    const raw = response.content.toString();
-    const sanitized = this.sanitizeJsonContent(raw);
-    const match = sanitized.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error('Planning failed: No JSON found');
-    const parsed = JSON.parse(match[0]);
-    if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('Planning failed: Invalid plan structure');
-    return parsed as ExecutionPlan;
+    const response = await this.llm.invoke([
+      new SystemMessage(planningPrompt),
+      new HumanMessage(
+        'Return only the JSON object for the plan. Do not add backticks. If unsure, return {"steps":[{"type":"db_query","subQuery":"USER_QUERY"}]} and replace USER_QUERY with the user query.',
+      ),
+    ]);
+    let raw = response.content.toString();
+    try {
+      const extracted = this.extractFirstJson(raw);
+      let parsed = JSON.parse(extracted);
+      if (Array.isArray(parsed)) parsed = { steps: parsed };
+      if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('Invalid plan structure');
+      return parsed as ExecutionPlan;
+    } catch (e1: any) {
+      // Retry once with a stricter request
+      try {
+        const retry = await this.llm.invoke([
+          new SystemMessage(planningPrompt),
+          new HumanMessage(
+            'Return ONLY a single JSON object per the schema. No markdown. If unsure, return {"steps":[{"type":"db_query","subQuery":"USER_QUERY"}]} with the user query filled.',
+          ),
+        ]);
+        raw = retry.content.toString();
+        const extracted = this.extractFirstJson(raw);
+        let parsed = JSON.parse(extracted);
+        if (Array.isArray(parsed)) parsed = { steps: parsed };
+        if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('Invalid plan structure');
+        return parsed as ExecutionPlan;
+      } catch (e2: any) {
+        // Default minimal plan fallback to avoid noisy warnings
+        logger.info('Planning JSON not found; using minimal default plan.');
+        const minimal: ExecutionPlan = { steps: [{ type: 'db_query', description: 'Direct query', subQuery: userQuery }] } as any;
+        return minimal;
+      }
+    }
   }
 
   // Execute plan steps in order
@@ -663,20 +835,15 @@ Examples:
 - Insert: {"operation":"insertOne","collection":"products","queryString":"Create a product","document":{"name":"Remede Serum","price":59.99}}
 - Update: {"operation":"updateOne","collection":"products","queryString":"Update product price","filter":{"sku":"RMD-001"},"update":{"$set":{"price":69.99}}}
 - Delete (safe): {"operation":"deleteOne","collection":"products","queryString":"Remove discontinued product","filter":{"sku":"RMD-001"}}
-`;
+\nImportant: Do not include markdown or code fences, and reply with a single JSON object only.`;
 
     const messages = [new SystemMessage(systemPrompt), new HumanMessage(userQuery)];
     const response = await this.llm.invoke(messages);
 
     try {
       const raw = response.content.toString();
-      const sanitizedText = this.sanitizeJsonContent(raw);
-      const jsonMatch = sanitizedText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No valid JSON found in AI response');
-      }
-
-      const queryObject = JSON.parse(jsonMatch[0]);
+      const extracted = this.extractFirstJsonObject(raw);
+      const queryObject = JSON.parse(extracted);
 
       if (!queryObject.operation || !queryObject.queryString) {
         throw new Error('Invalid query object structure');
@@ -741,20 +908,16 @@ Important:
 Examples:
 - Read: {"operation": "sql", "queryString": "Find all users", "sql": "SELECT id, name, email, created_at FROM users LIMIT 10", "parameters": []}
 - Update (safe): {"operation": "sql", "queryString": "Update product price", "sql": "UPDATE products SET price = $1 WHERE sku = $2", "parameters": [69.99, "RMD-001"]}
-- Delete (safe): {"operation": "sql", "queryString": "Delete discontinued product", "sql": "DELETE FROM products WHERE sku = $1", "parameters": ["RMD-001"]}`;
+- Delete (safe): {"operation": "sql", "queryString": "Delete discontinued product", "sql": "DELETE FROM products WHERE sku = $1", "parameters": ["RMD-001"]}
+\nImportant: Do not include markdown or code fences, and reply with a single JSON object only.`;
 
     const messages = [new SystemMessage(systemPrompt), new HumanMessage(userQuery)];
     const response = await this.llm.invoke(messages);
 
     try {
       const raw = response.content.toString();
-      const sanitizedText = this.sanitizeJsonContent(raw);
-      const jsonMatch = sanitizedText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No valid JSON found in AI response');
-      }
-
-      const queryObject = JSON.parse(jsonMatch[0]);
+      const extracted = this.extractFirstJsonObject(raw);
+      const queryObject = JSON.parse(extracted);
 
       if (!queryObject.operation || !queryObject.queryString || !queryObject.sql) {
         throw new Error('Invalid SQL query object structure');
@@ -806,7 +969,75 @@ Examples:
       .replace(/new Date\("([^"]+)"\)/g, '"$1"')
       .replace(/ISODate\("([^"]+)"\)/g, '"$1"')
       .replace(/\bTrue\b/g, 'true')
-      .replace(/\bFalse\b/g, 'false');
+      .replace(/\bFalse\b/g, 'false')
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'");
+  }
+
+  // Robustly extract the first JSON object from an LLM response, tolerating code fences and text
+  private extractFirstJsonObject(text: string): string {
+    const sanitizedText = this.sanitizeJsonContent(String(text || ''));
+    // Remove code fences like ```json ... ``` or ``` ... ```
+    let withoutFences = sanitizedText;
+    withoutFences = withoutFences.replace(/```json\s*([\s\S]*?)\s*```/gi, '$1');
+    withoutFences = withoutFences.replace(/```\s*([\s\S]*?)\s*```/g, '$1');
+
+    // Quick fast-path: simple { ... }
+    const directMatch = withoutFences.match(/\{[\s\S]*\}/);
+    if (directMatch) {
+      return directMatch[0];
+    }
+
+    // Bracket counting parser to find the first balanced JSON object
+    let depth = 0;
+    let start = -1;
+    for (let i = 0; i < withoutFences.length; i++) {
+      const ch = withoutFences[i];
+      if (ch === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === '}') {
+        if (depth > 0) depth--;
+        if (depth === 0 && start !== -1) {
+          return withoutFences.slice(start, i + 1);
+        }
+      }
+    }
+    throw new Error('No valid JSON found in AI response');
+  }
+
+  // Similar to extractFirstJsonObject but allows arrays as top-level JSON
+  private extractFirstJson(text: string): string {
+    let sanitizedText = this.sanitizeJsonContent(String(text || ''));
+    sanitizedText = sanitizedText.replace(/```json\s*([\s\S]*?)\s*```/gi, '$1');
+    sanitizedText = sanitizedText.replace(/```\s*([\s\S]*?)\s*```/g, '$1');
+
+    // Try object first
+    const obj = sanitizedText.match(/\{[\s\S]*\}/);
+    if (obj) return obj[0];
+
+    // Try array
+    const arr = sanitizedText.match(/\[[\s\S]*\]/);
+    if (arr) return arr[0];
+
+    // Fallback bracket counting for object
+    let depth = 0;
+    let start = -1;
+    for (let i = 0; i < sanitizedText.length; i++) {
+      const ch = sanitizedText[i];
+      if (ch === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === '}') {
+        if (depth > 0) depth--;
+        if (depth === 0 && start !== -1) return sanitizedText.slice(start, i + 1);
+      }
+    }
+    // Fallback for array (simple)
+    const firstOpen = sanitizedText.indexOf('[');
+    const lastClose = sanitizedText.lastIndexOf(']');
+    if (firstOpen >= 0 && lastClose > firstOpen) return sanitizedText.slice(firstOpen, lastClose + 1);
+    throw new Error('No valid JSON found in AI response');
   }
 
   // Post-process filter: convert placeholders and typed strings into proper types
