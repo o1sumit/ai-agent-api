@@ -301,7 +301,7 @@ export class AIAgentService {
             const step = plan.steps[i] as PlanStep;
             if (step.type === 'db_query') {
               const subQuery = (step as any).subQuery || userQuery;
-              const queryObject = await this.generateQuery(subQuery, schemaInfo, memoryInsights, dbConnection.type);
+              const queryObject = await this.generateQuery(subQuery, schemaInfo, enrichedMemory, dbConnection.type);
               executedQueries.push({ queryObject, result: null });
             }
           }
@@ -327,7 +327,7 @@ export class AIAgentService {
           // If no insight data fetched, run the planned execution
           const execution =
             finalData == null
-              ? await this.executePlannedSteps(plan, dbConnection, schemaInfo, memoryInsights, userQuery)
+              ? await this.executePlannedSteps(plan, dbConnection, schemaInfo, enrichedMemory, userQuery)
               : ({ finalData, executedQueries, toolOutputs } as any);
           finalData = execution.finalData;
           executedQueries = execution.executedQueries;
@@ -806,6 +806,9 @@ Strong Safety Rules:
 5) For aggregates, do not use $out/$merge stages.
 6) For reads, prefer minimal projections (exclude sensitive fields).
 7) Always specify the collection name.
+8) DO NOT invent fields. Only include fields explicitly requested by the user.
+9) For writes, DO NOT include _id, createdAt, or updatedAt unless explicitly provided by the user.
+10) Output MUST be strictly valid JSON (double quotes only, no comments, no trailing commas), and must NOT include non-JSON tokens like ISODate(), new Date(), ObjectId(), NumberLong().
 
 Relationship Guidance:
 - If schema relationships indicate references between collections, prefer aggregation with $lookup to join related data. Use indexed fields for join keys when possible.
@@ -829,6 +832,7 @@ Additional Guidance:
 - Use regex for text searches: {"field": {"$regex": "pattern", "$options": "i"}}
 - Use DATE_7_DAYS_AGO, DATE_30_DAYS_AGO, DATE_TODAY placeholders in filters; they will be converted to Date objects.
 - For write operations, only include relevant fields, never passwords.
+ - NEVER include non-JSON tokens. Dates must be plain ISO strings if provided.
 
 Examples:
 - Read: {"operation":"find","collection":"users","queryString":"Get first 10 users","filter":{},"projection":{"password":0},"sort":{"createdAt":-1},"limit":10}
@@ -855,6 +859,14 @@ Examples:
 
       if (!queryObject.collection) {
         queryObject.collection = 'users';
+      }
+
+      // Post-process write payloads to convert placeholders/tokens safely
+      if (queryObject.document) {
+        queryObject.document = this.postProcessAny(queryObject.document);
+      }
+      if (queryObject.update) {
+        queryObject.update = this.postProcessAny(queryObject.update);
       }
 
       return queryObject;
@@ -904,6 +916,7 @@ Important:
 - Use proper date/time functions for ${dbType.toUpperCase()}
 - Consider performance and use appropriate indexes
 - Exclude sensitive fields like passwords
+ - For INSERT statements, include only fields explicitly provided by the user. Do NOT invent created_at/updated_at unless specified. Parameterize all values.
 
 Examples:
 - Read: {"operation": "sql", "queryString": "Find all users", "sql": "SELECT id, name, email, created_at FROM users LIMIT 10", "parameters": []}
@@ -965,9 +978,23 @@ Examples:
   // Convert common non-JSON tokens produced by LLM into proper JSON
   private sanitizeJsonContent(text: string): string {
     return text
+      // ObjectId variants
       .replace(/ObjectId\("([0-9a-fA-F]{24})"\)/g, '"$1"')
+      .replace(/ObjectId\('\s*([0-9a-fA-F]{24})\s*'\)/g, '"$1"')
+      .replace(/ObjectId\(\s*([0-9a-fA-F]{24})\s*\)/g, '"$1"')
+      // Date-like constructors
       .replace(/new Date\("([^"]+)"\)/g, '"$1"')
+      .replace(/new Date\(\s*\)/g, '"DATE_TODAY"')
+      .replace(/\bDate\(\s*"?([^\")]+)"?\s*\)/g, '"$1"')
+      // ISODate variants
       .replace(/ISODate\("([^"]+)"\)/g, '"$1"')
+      .replace(/ISODate\('\s*([^']+)\s*'\)/g, '"$1"')
+      .replace(/ISODate\(\s*\)/g, '"DATE_TODAY"')
+      // Number wrappers
+      .replace(/NumberLong\("?([^\)"]+)"?\)/g, '$1')
+      .replace(/NumberDecimal\("?([^\)"]+)"?\)/g, '$1')
+      // Timestamp wrapper
+      .replace(/Timestamp\(([^)]+)\)/g, '"$1"')
       .replace(/\bTrue\b/g, 'true')
       .replace(/\bFalse\b/g, 'false')
       .replace(/[“”]/g, '"')
@@ -1044,6 +1071,31 @@ Examples:
   private postProcessFilter(filter: any): any {
     const processed = this.replaceDatePlaceholders(filter);
     // Convert stringified ObjectId-like fields to actual ObjectId if safe
+    const convert = (obj: any): any => {
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        for (const key of Object.keys(obj)) {
+          const val = obj[key];
+          if (typeof val === 'string' && /^[0-9a-fA-F]{24}$/.test(val)) {
+            try {
+              obj[key] = new (mongoose as any).Types.ObjectId(val);
+            } catch {
+              /* ignore */
+            }
+          } else if (typeof val === 'object') {
+            obj[key] = convert(val);
+          }
+        }
+      } else if (Array.isArray(obj)) {
+        return obj.map(v => convert(v));
+      }
+      return obj;
+    };
+    return convert(processed);
+  }
+
+  // Post-process arbitrary payloads (document/update): convert date placeholders and ObjectId-like strings
+  private postProcessAny(payload: any): any {
+    const processed = this.replaceDatePlaceholders(payload);
     const convert = (obj: any): any => {
       if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
         for (const key of Object.keys(obj)) {
