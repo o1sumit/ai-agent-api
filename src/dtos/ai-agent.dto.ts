@@ -19,6 +19,10 @@ export class AIQueryDto {
   @IsBoolean()
   @IsOptional()
   public refreshSchema?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  public dryRun?: boolean;
 }
 
 export class AIFeedbackDto {
