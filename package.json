@@ -4,6 +4,7 @@
   "description": "TypeScript + Mongoose + MongoDB + Express API Server",
   "author": "",
   "license": "ISC",
+  "main": "dist/app.js",
   "scripts": {
     "start": "npm run build && cross-env NODE_ENV=production node dist/server.js",
     "dev": "cross-env NODE_ENV=development nodemon",
